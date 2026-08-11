@@ -11,6 +11,15 @@ from app.db.models import UpstreamResourceBinding
 logger = logging.getLogger(__name__)
 
 
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Normalize DB/driver datetimes to timezone-aware UTC for safe comparisons."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def bind_resource(
     db: Session,
     *,
@@ -67,14 +76,13 @@ def bind_resource(
             )
             return
 
-        existing_expires_at = existing.expires_at
-        if existing_expires_at is not None and existing_expires_at.tzinfo is None:
-            existing_expires_at = existing_expires_at.replace(tzinfo=timezone.utc)
+        existing_expires_at = _as_utc(existing.expires_at)
+        new_expires_at = _as_utc(expires_at)
 
-        if expires_at is not None and (
-            existing_expires_at is None or existing_expires_at < expires_at
+        if new_expires_at is not None and (
+            existing_expires_at is None or existing_expires_at < new_expires_at
         ):
-            existing.expires_at = expires_at
+            existing.expires_at = new_expires_at
             try:
                 db.commit()
             except Exception:
@@ -125,9 +133,7 @@ def lookup_bound_key_id(
     if record is None:
         return None
 
-    expires_at = record.expires_at
-    if expires_at is not None and expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    expires_at = _as_utc(record.expires_at)
     if expires_at is not None and expires_at < datetime.now(timezone.utc):
         try:
             db.delete(record)

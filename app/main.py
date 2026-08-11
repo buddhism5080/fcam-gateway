@@ -46,20 +46,19 @@ def create_app(*, config: AppConfig | None = None, secrets: Secrets | None = Non
             yield
         finally:
             await stop_credit_refresh_scheduler(app)
-
-        try:
-            db_engine = getattr(app.state, "db_engine", None)
-            if db_engine is not None:
-                db_engine.dispose()
-        except Exception:
-            logger.exception("app.shutdown_db_dispose_failed")
-
-        redis_client = getattr(app.state, "redis", None)
-        if redis_client is not None:
             try:
-                redis_client.close()
+                db_engine = getattr(app.state, "db_engine", None)
+                if db_engine is not None:
+                    db_engine.dispose()
             except Exception:
-                logger.exception("app.shutdown_redis_close_failed")
+                logger.exception("app.shutdown_db_dispose_failed")
+
+            redis_client = getattr(app.state, "redis", None)
+            if redis_client is not None:
+                try:
+                    redis_client.close()
+                except Exception:
+                    logger.exception("app.shutdown_redis_close_failed")
 
     app = FastAPI(
         docs_url="/docs" if config.server.enable_docs else None,

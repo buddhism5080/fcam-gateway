@@ -92,23 +92,12 @@ def _audit(
 def _key_item(key: ApiKey, *, request: Request) -> dict[str, Any]:
     current_concurrent = request.app.state.key_concurrency.current(str(key.id))
 
-    # 计算总额度：从第一条快照获取
+    # Prefer plan credits; fall back to remaining. Avoid per-key extra DB round-trip on list.
     cached_total_credits = None
-    try:
-        db = request.app.state.db_session_factory()
-        first_snapshot = (
-            db.query(CreditSnapshot)
-            .filter(CreditSnapshot.api_key_id == key.id, CreditSnapshot.fetch_success.is_(True))
-            .order_by(CreditSnapshot.snapshot_at.asc())
-            .first()
-        )
-        if first_snapshot is not None:
-            cached_total_credits = first_snapshot.remaining_credits
-        elif key.cached_remaining_credits is not None:
-            cached_total_credits = key.cached_remaining_credits
-        db.close()
-    except Exception:
-        pass
+    if key.cached_plan_credits is not None and int(key.cached_plan_credits) > 0:
+        cached_total_credits = int(key.cached_plan_credits)
+    elif key.cached_remaining_credits is not None:
+        cached_total_credits = int(key.cached_remaining_credits)
 
     return {
         "id": key.id,
@@ -605,13 +594,8 @@ def update_key(
         raise FcamError(status_code=404, code="NOT_FOUND", message="Not found")
 
     if payload.client_id is not None:
-        if payload.client_id == 0:
-            key.client_id = None
-        else:
-            exists = db.query(Client.id).filter(Client.id == payload.client_id).one_or_none()
-            if exists is None:
-                raise FcamError(status_code=404, code="NOT_FOUND", message="Client not found")
-            key.client_id = payload.client_id
+        # Unified global pool: never re-bind keys to clients. Accept 0 as explicit unassign.
+        key.client_id = None
 
     if payload.api_key is not None:
         if not secrets.master_key:
@@ -1479,22 +1463,14 @@ def dashboard_stats(
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
     try:
+        # Global upstream pool: key inventory is never filtered by client ownership.
         keys_q = db.query(ApiKey)
-        if client_id is not None:
-            keys_q = (
-                keys_q.join(Client, Client.id == ApiKey.client_id)
-                .filter(ApiKey.client_id == client_id, Client.is_active.is_(True))
-            )
-        else:
-            keys_q = (
-                keys_q.outerjoin(Client, Client.id == ApiKey.client_id)
-                .filter(or_(ApiKey.client_id.is_(None), Client.is_active.is_(True)))
-            )
-
         keys_total = keys_q.count()
-        keys_failed = keys_q.filter(ApiKey.status.in_(["failed", "decrypt_failed"])).count()
+        keys_failed = keys_q.filter(
+            ApiKey.status.in_(["failed", "decrypt_failed", "invalid"])
+        ).count()
 
-        clients_q = db.query(Client).filter(Client.is_active.is_(True))
+        clients_q = db.query(Client).filter(Client.is_active.is_(True), Client.status != "deleted")
         if client_id is not None:
             clients_q = clients_q.filter(Client.id == client_id)
         clients_total = clients_q.count()
@@ -1506,7 +1482,6 @@ def dashboard_stats(
         )
         if client_id is not None:
             logs_q = logs_q.filter(RequestLog.client_id == client_id)
-        # 不将未认证/无 client_id 的请求计入“业务侧请求量”
 
         requests_total = logs_q.count()
         requests_failed = logs_q.filter(

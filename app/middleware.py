@@ -331,6 +331,8 @@ class RequestLimitsMiddleware(BaseHTTPMiddleware):
             if seg not in self._allowed_exa_paths:
                 raise FcamError(status_code=404, code="PATH_NOT_ALLOWED", message="Path not allowed")
 
+        is_proxy = api_prefix is not None or path.startswith("/exa/")
+
         if request.method not in {"GET", "HEAD"}:
             content_length = request.headers.get("content-length")
             if content_length:
@@ -354,13 +356,6 @@ class RequestLimitsMiddleware(BaseHTTPMiddleware):
             if not body:
                 return await call_next(request)
 
-            content_type = request.headers.get("content-type", "")
-            if "application/json" not in content_type:
-                raise FcamError(
-                    status_code=415,
-                    code="UNSUPPORTED_MEDIA_TYPE",
-                    message="Only application/json is supported",
-                )
             if len(body) > self._max_body_bytes:
                 raise FcamError(
                     status_code=413,
@@ -368,5 +363,16 @@ class RequestLimitsMiddleware(BaseHTTPMiddleware):
                     message="Request body too large",
                     details={"max_body_bytes": self._max_body_bytes},
                 )
+
+            # Only proxy data-plane requires JSON. Admin/control plane is also JSON in practice,
+            # but keep the content-type gate focused on client-facing proxy paths.
+            if is_proxy:
+                content_type = request.headers.get("content-type", "")
+                if "application/json" not in content_type:
+                    raise FcamError(
+                        status_code=415,
+                        code="UNSUPPORTED_MEDIA_TYPE",
+                        message="Only application/json is supported",
+                    )
 
         return await call_next(request)

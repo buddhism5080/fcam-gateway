@@ -173,7 +173,10 @@ def test_bind_resource_conflict_same_key_extends_expires_at(tmp_path):
             .one()
         )
         assert r2.expires_at is not None
-        assert r2.expires_at > expires_1
+        # SQLite may round-trip timezone-aware as naive; normalize before compare.
+        e1 = expires_1 if expires_1.tzinfo else expires_1.replace(tzinfo=timezone.utc)
+        e2 = r2.expires_at if r2.expires_at.tzinfo else r2.expires_at.replace(tzinfo=timezone.utc)
+        assert e2 > e1
 
 
 def test_lookup_bound_key_id_deletes_expired_record(tmp_path):

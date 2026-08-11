@@ -245,8 +245,9 @@ def test_admin_update_key_rotate_unbind_quota_and_active_transitions(tmp_path):
             headers=_admin_headers(),
             json={"client_id": 999999},
         )
-        assert rbad_client.status_code == 404
-        assert rbad_client.json()["error"]["code"] == "NOT_FOUND"
+        # Global pool: client_id is ignored (forced unassigned), not a 404.
+        assert rbad_client.status_code == 200
+        assert rbad_client.json()["client_id"] is None
 
         rrotate = client.put(
             f"/admin/keys/{key_id}",

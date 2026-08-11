@@ -61,7 +61,11 @@ async def fetch_credit_from_firecrawl(
             db.rollback()
         raise FcamError(status_code=500, code="DECRYPTION_FAILED", message="Failed to decrypt API key") from exc
 
-    url = f"{config.firecrawl.base_url}/v2/team/credit-usage"
+    # Normalize base_url: strip trailing /v1|/v2 so we always hit /v2/team/credit-usage
+    from app.core.urlutil import strip_provider_version_suffix
+
+    base_url, _ = strip_provider_version_suffix(config.firecrawl.base_url)
+    url = f"{base_url}/v2/team/credit-usage"
     headers = {
         "Authorization": f"Bearer {plaintext_api_key}",
         "X-Request-Id": request_id,

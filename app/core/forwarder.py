@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from cryptography.exceptions import InvalidTag
@@ -19,6 +18,7 @@ from app.core.cooldown import NoopCooldownStore
 from app.core.key_pool import KeyPool
 from app.core.rate_limit import TokenBucketRateLimiter
 from app.core.security import decrypt_api_key, derive_master_key_bytes
+from app.core.urlutil import strip_provider_version_suffix
 from app.db.models import ApiKey, Client
 from app.errors import FcamError
 from app.observability.metrics import Metrics
@@ -76,22 +76,7 @@ class KeyTestResult:
 
 
 def _strip_firecrawl_version_suffix(base_url: str) -> tuple[str, str | None]:
-    normalized = base_url.rstrip("/")
-    parts = urlsplit(normalized)
-    if not parts.scheme or not parts.netloc:
-        return normalized, None
-
-    path = parts.path.rstrip("/")
-    version: str | None = None
-    if path.endswith("/v1"):
-        version = "v1"
-        path = path[:-3]
-    elif path.endswith("/v2"):
-        version = "v2"
-        path = path[:-3]
-
-    stripped = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
-    return stripped.rstrip("/"), version
+    return strip_provider_version_suffix(base_url)
 
 
 def _parse_retry_after(headers: httpx.Headers) -> int | None:
@@ -105,32 +90,36 @@ def _parse_retry_after(headers: httpx.Headers) -> int | None:
     return max(seconds, 0)
 
 
-_CREDIT_ERROR_MARKERS = (
-    "insufficient credit",
-    "insufficient credits",
-    "no credits",
-    "out of credits",
-    "credit limit",
-    "payment required",
-    "quota exceeded",
-    "not enough credits",
-    "remaining credits",
-)
+_CREDIT_ERROR_MARKERS = ()  # kept for import compatibility; logic is inline in _looks_like_credit_error
 
 
 def _looks_like_credit_error(resp: httpx.Response) -> bool:
     """Detect upstream responses that indicate the selected key is out of credits."""
-    if resp.status_code == 402:
+    code = int(resp.status_code)
+    if code == 402:
         return True
-    if resp.status_code not in {400, 402, 403, 429, 402}:
-        # Also scan 4xx bodies that look credit-related
-        if resp.status_code < 400 or resp.status_code >= 500:
-            return False
+    # Only inspect client-error bodies; never treat 2xx/5xx as credit exhaustion.
+    if code < 400 or code >= 500:
+        return False
     try:
-        text = (resp.text or "").lower()
+        # Bound read — avoid materialising huge error bodies.
+        raw = resp.content[:2048] if resp.content else b""
+        text = raw.decode("utf-8", errors="replace").lower()
     except Exception:
         return False
-    return any(m in text for m in _CREDIT_ERROR_MARKERS)
+    # Avoid overly broad markers like bare "remaining credits".
+    markers = (
+        "insufficient credit",
+        "insufficient credits",
+        "no credits",
+        "out of credits",
+        "credit limit",
+        "payment required",
+        "not enough credits",
+        "exceeded your credit",
+        "credits exhausted",
+    )
+    return any(m in text for m in markers)
 
 
 def _client_retry_budget(client: Client, provider_max: int) -> int:
@@ -584,11 +573,14 @@ class Forwarder:
 
                 allowed, _retry_after = self._key_rate_limiter.allow(str(key.id), key.rate_limit_per_min)
                 if not allowed:
+                    # Soft-exclude for this request so we try other keys instead of spinning.
+                    tried_key_ids.add(key.id)
                     retry_count += 1
                     continue
 
                 lease = self._key_concurrency.try_acquire(str(key.id), key.max_concurrent)
                 if lease is None:
+                    tried_key_ids.add(key.id)
                     retry_count += 1
                     continue
 

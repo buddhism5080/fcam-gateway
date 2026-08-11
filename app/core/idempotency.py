@@ -166,6 +166,29 @@ def start_or_replay(
                 response_body=str(existing.response_body),
             )
 
+        # Stale in_progress: previous worker crashed / never completed.
+        # Allow takeover after a short grace period instead of blocking until TTL.
+        created = existing.created_at
+        if created is not None and created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        stale_after = timedelta(seconds=min(max(int(config.idempotency.ttl_seconds) // 12, 30), 120))
+        if existing.status == "in_progress" and created is not None and (now - created) > stale_after:
+            try:
+                db.delete(existing)
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                raise FcamError(status_code=503, code="DB_UNAVAILABLE", message="Database unavailable") from exc
+            return start_or_replay(
+                db=db,
+                config=config,
+                client_id=client_id,
+                idempotency_key=idempotency_key,
+                endpoint=endpoint,
+                method=method,
+                payload=payload,
+            )
+
         raise FcamError(
             status_code=409,
             code="IDEMPOTENCY_IN_PROGRESS",

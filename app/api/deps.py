@@ -123,10 +123,11 @@ def enforce_client_governance(
     if config.quota.enable_quota_check and client.daily_quota is not None:
         try:
             today = today_in_timezone(config.quota.timezone)
+            dirty = False
             if client.quota_reset_at != today:
                 client.daily_usage = 0
                 client.quota_reset_at = today
-                db.commit()
+                dirty = True
 
             if client.daily_usage >= client.daily_quota:
                 retry_after_q = seconds_until_next_midnight(config.quota.timezone)
@@ -140,6 +141,11 @@ def enforce_client_governance(
                         }
                     },
                 )
+                if dirty:
+                    try:
+                        db.commit()
+                    except Exception:
+                        db.rollback()
                 lease.release()
                 raise FcamError(
                     status_code=429,
@@ -147,6 +153,9 @@ def enforce_client_governance(
                     message="Client quota exceeded",
                     retry_after=retry_after_q,
                 )
+
+            if dirty:
+                db.commit()
 
         except FcamError:
             raise

@@ -186,6 +186,13 @@ async def _refresh_once(*, db_factory: Callable[[], Session], master_key: bytes,
             return
 
         workers = max(int(getattr(config.credit_monitoring, "workers", 4) or 4), 1)
+        # SQLite does not love multi-writer contention — serialize refresh under sqlite.
+        try:
+            bind = db.get_bind()
+            if bind is not None and bind.dialect.name == "sqlite":
+                workers = 1
+        except Exception:
+            pass
         batch_size = max(int(config.credit_monitoring.batch_size), 1)
         batch_delay = max(int(config.credit_monitoring.batch_delay_seconds), 0)
         sem = asyncio.Semaphore(workers)
