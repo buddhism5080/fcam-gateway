@@ -1,0 +1,133 @@
+name: Docker
+
+on:
+  push:
+    branches: [master, main, "feat/**"]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Build platforms (comma-separated)"
+        required: false
+        default: "linux/amd64,linux/arm64"
+      push:
+        description: "Push image to GHCR (false = build only)"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: read
+  packages: write
+  # needed for GITHUB_TOKEN to push packages on some org setups
+  id-token: write
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ghcr.io/<owner>/<repo> lowercased
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    name: Build${{ (github.event_name != 'pull_request' && (github.event.inputs.push || 'true') != 'false') && ' & Push' || '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Lowercase image name
+        id: image
+        run: |
+          echo "name=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.title=Firecrawl API Manager (FCAM)
+            org.opencontainers.image.description=Unified Firecrawl/Exa key pool gateway
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request' && (github.event.inputs.push || 'true') != 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve platforms
+        id: platforms
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PRs: single-arch build-only (faster, no push)
+            echo "list=linux/amd64" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.inputs.platforms }}" ]; then
+            echo "list=${{ github.event.inputs.platforms }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "list=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ steps.platforms.outputs.list }}
+          push: ${{ github.event_name != 'pull_request' && (github.event.inputs.push || 'true') != 'false' }}
+          load: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Summary
+        run: |
+          {
+            echo "## Docker image"
+            echo ""
+            echo "- **Image:** \`${{ steps.image.outputs.name }}\`"
+            echo "- **Platforms:** \`${{ steps.platforms.outputs.list }}\`"
+            echo "- **Push:** \`${{ github.event_name != 'pull_request' && (github.event.inputs.push || 'true') != 'false' }}\`"
+            echo ""
+            echo "### Tags"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "### Pull"
+            echo '```bash'
+            echo "docker pull ${{ steps.image.outputs.name }}:sha-$(echo '${{ github.sha }}' | cut -c1-7)"
+            if [ "${{ github.ref }}" = "refs/heads/master" ] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              echo "docker pull ${{ steps.image.outputs.name }}:latest"
+            fi
+            BRANCH_TAG=$(echo '${{ github.ref_name }}' | tr '/' '-')
+            echo "docker pull ${{ steps.image.outputs.name }}:${BRANCH_TAG}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
