@@ -21,7 +21,8 @@ const showConnect = ref(false);
 
 const navItems = [
   { to: "/dashboard", label: "仪表盘" },
-  { to: "/clients", label: "Clients & Keys" },
+  { to: "/keys", label: "上游 Keys" },
+  { to: "/clients", label: "下游 Clients" },
   { to: "/logs", label: "请求日志" },
   { to: "/audit", label: "审计日志" },
 ] as const;

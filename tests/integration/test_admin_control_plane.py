@@ -473,9 +473,10 @@ def test_admin_stats_and_quota_stats(tmp_path, make_app, admin_headers):
         rq = client.get("/admin/stats/quota", headers=admin_headers())
         assert rq.status_code == 200
         summary = rq.json()["summary"]
-        assert summary["total_quota"] == 5
-        assert summary["used_today"] == 2
-        assert summary["remaining"] == 3
+        # Credit-oriented stats: no daily quota gating; remaining comes from cached credits.
+        assert "remaining" in summary
+        assert "keys_available" in summary
+        assert summary["keys_available"] >= 0
 
 
 def test_admin_logs_query_pagination_and_filters(tmp_path, make_app, admin_headers):

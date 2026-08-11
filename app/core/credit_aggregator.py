@@ -17,13 +17,20 @@ def _dt_to_rfc3339(dt: datetime | None) -> str | None:
 
 
 def aggregate_client_credits(db: Session, client_id: int) -> dict[str, Any]:
+    """
+    Client-scoped credits view.
+
+    With the unified global pool, upstream keys are no longer bound to clients.
+    This endpoint returns the **global pool** credit summary (same for every client),
+    plus the client identity for UI convenience.
+    """
     client = db.query(Client).filter(Client.id == int(client_id)).one_or_none()
     if client is None:
         raise ValueError(f"Client {client_id} not found")
 
     keys = (
         db.query(ApiKey)
-        .filter(ApiKey.client_id == int(client_id), ApiKey.is_active.is_(True))
+        .filter(ApiKey.is_active.is_(True))
         .order_by(ApiKey.id.asc())
         .all()
     )

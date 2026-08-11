@@ -132,51 +132,49 @@ def test_admin_logs_filters_include_from_to_and_level_error(tmp_path):
         assert items[0]["level"] == "error"
 
 
-def test_admin_keys_list_filters_by_client_id_and_rejects_long_q(tmp_path):
+def test_admin_keys_list_global_pool_and_rejects_long_q(tmp_path):
     app = _make_app(tmp_path, db_name="keys_list.db")
     with TestClient(app) as client:
-        client_id = _create_client(client, name="svc-keys")
+        _create_client(client, name="svc-keys")
 
-        unassigned_id = _create_key(client, api_key="fc-xxxxxxxxxxxxxxxx0001", name="u1", client_id=0)
-        assigned_id = _create_key(client, api_key="fc-xxxxxxxxxxxxxxxx0002", name="a1", client_id=client_id)
+        k1 = _create_key(client, api_key="fc-xxx...0001", name="u1")
+        k2 = _create_key(client, api_key="fc-xxx...0002", name="a1")
 
-        runassigned = client.get("/admin/keys?client_id=0", headers=_admin_headers())
-        assert runassigned.status_code == 200
-        ids = {i["id"] for i in runassigned.json()["items"]}
-        assert unassigned_id in ids
-        assert assigned_id not in ids
-
-        rbound = client.get(f"/admin/keys?client_id={client_id}", headers=_admin_headers())
-        assert rbound.status_code == 200
-        ids2 = {i["id"] for i in rbound.json()["items"]}
-        assert assigned_id in ids2
-        assert unassigned_id not in ids2
+        rall = client.get("/admin/keys", headers=_admin_headers())
+        assert rall.status_code == 200
+        ids = {i["id"] for i in rall.json()["items"]}
+        assert k1 in ids and k2 in ids
+        # Global pool: client_id always null
+        assert all(i.get("client_id") in (None, 0) for i in rall.json()["items"])
 
         rqlong = client.get("/admin/keys", headers=_admin_headers(), params={"q": "a" * 201})
         assert rqlong.status_code == 400
         assert rqlong.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
-def test_admin_create_key_not_ready_without_master_key_and_404_when_client_missing(tmp_path):
+
+def test_admin_create_key_not_ready_without_master_key(tmp_path):
     app_not_ready = _make_app(tmp_path, db_name="create_key_not_ready.db", master_key=None)
     with TestClient(app_not_ready) as client:
         r = client.post(
             "/admin/keys",
             headers=_admin_headers(),
-            json={"api_key": "fc-xxxxxxxxxxxxxxxx0001"},
+            json={"api_key": "fc-xxx...0001"},
         )
         assert r.status_code == 503
         assert r.json()["error"]["code"] == "NOT_READY"
 
-    app = _make_app(tmp_path, db_name="create_key_client_missing.db", master_key="master")
+    # client_id is ignored (global pool) — create still succeeds
+    app = _make_app(tmp_path, db_name="create_key_global.db", master_key="master")
     with TestClient(app) as client:
         r = client.post(
             "/admin/keys",
             headers=_admin_headers(),
-            json={"api_key": "fc-xxxxxxxxxxxxxxxx0001", "client_id": 999999},
+            json={"api_key": "fc-xxx...0009", "client_id": 999999},
         )
-        assert r.status_code == 404
-        assert r.json()["error"]["code"] == "NOT_FOUND"
+        assert r.status_code == 201
+        assert r.json().get("client_id") in (None, 0)
+
 
 
 def test_admin_import_text_not_ready_client_not_found_and_no_valid_lines(tmp_path):
@@ -192,41 +190,34 @@ def test_admin_import_text_not_ready_client_not_found_and_no_valid_lines(tmp_pat
         assert rbad.status_code == 400
         assert rbad.json()["error"]["code"] == "VALIDATION_ERROR"
 
+        # client_id ignored in global pool — import proceeds
         rmissing = client.post(
             "/admin/keys/import-text",
             headers=_admin_headers(),
-            json={"client_id": 999999, "text": "fc-xxxxxxxxxxxxxxxx0001"},
+            json={"client_id": 999999, "text": "fc-import-key-aaaa"},
         )
-        assert rmissing.status_code == 404
-        assert rmissing.json()["error"]["code"] == "NOT_FOUND"
+        assert rmissing.status_code == 200
+        assert rmissing.json()["created"] >= 1
 
 
-def test_admin_import_text_conflict_with_other_client_and_skipped_when_no_changes(tmp_path):
+
+def test_admin_import_text_skipped_when_no_changes(tmp_path):
     app = _make_app(tmp_path, db_name="import_text_conflict.db", master_key="master")
     with TestClient(app) as client:
-        c1 = _create_client(client, name="svc-a")
-        c2 = _create_client(client, name="svc-b")
-        _create_key(client, api_key="fc-xxxxxxxxxxxxxxxx0001", name="k1", client_id=c1)
+        _create_client(client, name="svc-a")
+        _create_key(client, api_key="fc-shared-key-0001", name="k1")
 
-        rconflict = client.post(
-            "/admin/keys/import-text",
-            headers=_admin_headers(),
-            json={"client_id": c2, "text": "fc-xxxxxxxxxxxxxxxx0001"},
-        )
-        assert rconflict.status_code == 200
-        body = rconflict.json()
-        assert body["failed"] == 1
-        assert body["failures"][0]["message"] == "api key already bound to a different client"
-
+        # Same key again → skipped (no changes)
         rskip = client.post(
             "/admin/keys/import-text",
             headers=_admin_headers(),
-            json={"text": "fc-xxxxxxxxxxxxxxxx0001"},
+            json={"text": "fc-shared-key-0001"},
         )
         assert rskip.status_code == 200
         body2 = rskip.json()
         assert body2["skipped"] == 1
         assert body2["failed"] == 0
+
 
 
 def test_admin_update_key_rotate_unbind_quota_and_active_transitions(tmp_path):
@@ -276,7 +267,7 @@ def test_admin_update_key_rotate_unbind_quota_and_active_transitions(tmp_path):
             json={"daily_quota": 1},
         )
         assert rquota.status_code == 200
-        assert rquota.json()["status"] == "quota_exceeded"
+        assert rquota.json()["status"] == "active"  # daily_quota no longer gates status
 
         rdisable = client.put(
             f"/admin/keys/{key_id}",
@@ -370,7 +361,7 @@ def test_admin_batch_keys_patch_updates_fields_and_soft_delete_and_invalid_test_
         assert results[k1_id]["ok"] is True
         assert results[k1_id]["key"]["status"] == "active"
         assert results[k2_id]["ok"] is True
-        assert results[k2_id]["key"]["status"] == "quota_exceeded"
+        assert results[k2_id]["key"]["status"] == "active"  # daily_quota no longer gates status
 
         rsoft = client.post(
             "/admin/keys/batch",

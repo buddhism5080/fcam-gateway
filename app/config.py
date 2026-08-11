@@ -74,9 +74,10 @@ class SecurityConfig(BaseModel):
 class QuotaConfig(BaseModel):
     timezone: str = "UTC"
     count_mode: str = "success"  # success | attempt
-    default_daily_limit: int = 5
+    default_daily_limit: int = 0
     reset_time: str = "00:00"
-    enable_quota_check: bool = True
+    # Key daily quota removed from scheduling; client daily quota optional & off by default.
+    enable_quota_check: bool = False
 
 
 class RateLimitConfig(BaseModel):
@@ -110,6 +111,8 @@ class CreditMonitoringConfig(BaseModel):
     )
     batch_size: int = 10
     batch_delay_seconds: int = 5
+    # Concurrent credit-refresh workers (asyncio tasks / thread-like parallelism).
+    workers: int = 4
     local_estimation: CreditMonitoringLocalEstimationConfig = Field(
         default_factory=CreditMonitoringLocalEstimationConfig
     )
@@ -118,6 +121,13 @@ class CreditMonitoringConfig(BaseModel):
     refresh_check_interval_seconds: int = 300
     min_manual_refresh_interval_seconds: int = 300
     history_max_limit: int = 500
+
+
+class SchedulingConfig(BaseModel):
+    """Scientific upstream key selection weights."""
+
+    freshness_half_life_seconds: int = 6 * 3600
+    unknown_credit_baseline: float = 50.0
 
 
 class IdempotencyConfig(BaseModel):
@@ -204,6 +214,7 @@ class AppConfig(BaseModel):
     quota: QuotaConfig = Field(default_factory=QuotaConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     credit_monitoring: CreditMonitoringConfig = Field(default_factory=CreditMonitoringConfig)
+    scheduling: SchedulingConfig = Field(default_factory=SchedulingConfig)
     idempotency: IdempotencyConfig = Field(default_factory=IdempotencyConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

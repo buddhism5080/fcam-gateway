@@ -137,10 +137,11 @@ def seed_client() -> Callable[..., tuple[Client, str]]:
         master_key: str,
         token: str = "fcam_client_token",
         name: str = "svc",
-        daily_quota: int = 10_000,
+        daily_quota: int | None = None,
         daily_usage: int = 0,
         rate_limit_per_min: int = 10_000,
         max_concurrent: int = 10,
+        max_retries: int = 3,
         is_active: bool = True,
     ) -> tuple[Client, str]:
         token_hash = hmac_sha256_hex(derive_master_key_bytes(master_key), token)
@@ -153,6 +154,7 @@ def seed_client() -> Callable[..., tuple[Client, str]]:
             quota_reset_at=today_in_timezone("UTC"),
             rate_limit_per_min=rate_limit_per_min,
             max_concurrent=max_concurrent,
+            max_retries=max_retries,
         )
         db.add(c)
         db.commit()

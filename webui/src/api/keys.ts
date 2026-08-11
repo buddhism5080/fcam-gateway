@@ -45,25 +45,23 @@ export type KeyListResponse = {
 };
 
 export async function fetchKeys(
-  opts: { clientId?: number; unassigned?: boolean; page?: number; pageSize?: number; q?: string; provider?: string } = {}
+  opts: { page?: number; pageSize?: number; q?: string; provider?: string } = {}
 ) {
   const params: Record<string, number | string> = {};
-  if (opts.unassigned) params.client_id = 0;
-  else if (opts.clientId) params.client_id = opts.clientId;
   if (opts.page) params.page = opts.page;
   if (opts.pageSize) params.page_size = opts.pageSize;
   if (opts.q) params.q = opts.q;
   if (opts.provider) params.provider = opts.provider;
-  const res = await http.get<KeyListResponse>("/admin/keys", { params: Object.keys(params).length ? params : undefined });
+  const res = await http.get<KeyListResponse>("/admin/keys", {
+    params: Object.keys(params).length ? params : undefined,
+  });
   return res.data;
 }
 
 export type CreateKeyRequest = {
   api_key: string;
-  client_id?: number | null;
   name?: string | null;
   plan_type?: string;
-  daily_quota?: number;
   max_concurrent?: number;
   rate_limit_per_min?: number;
   is_active?: boolean;
@@ -76,10 +74,8 @@ export async function createKey(payload: CreateKeyRequest) {
 }
 
 export type ImportKeysTextRequest = {
-  client_id?: number | null;
   text: string;
   plan_type?: string;
-  daily_quota?: number;
   max_concurrent?: number;
   rate_limit_per_min?: number;
   is_active?: boolean;
@@ -98,10 +94,8 @@ export async function importKeysText(payload: ImportKeysTextRequest) {
 }
 
 export type UpdateKeyRequest = {
-  client_id?: number | null;
   name?: string | null;
   plan_type?: string | null;
-  daily_quota?: number | null;
   max_concurrent?: number | null;
   rate_limit_per_min?: number | null;
   is_active?: boolean | null;
@@ -138,14 +132,15 @@ export type TestKeyResponse = {
 };
 
 export async function testKey(keyId: number, payload?: TestKeyRequest) {
-  const res = await http.post<TestKeyResponse>(`/admin/keys/${keyId}/test`, payload || {}, { timeout: 60_000 });
+  const res = await http.post<TestKeyResponse>(`/admin/keys/${keyId}/test`, payload || {}, {
+    timeout: 60_000,
+  });
   return res.data;
 }
 
 export type BatchKeyPatch = {
   name?: string | null;
   plan_type?: string | null;
-  daily_quota?: number | null;
   max_concurrent?: number | null;
   rate_limit_per_min?: number | null;
   is_active?: boolean | null;
@@ -181,6 +176,10 @@ export type BatchKeysResponse = {
 
 export async function batchKeys(payload: BatchKeysRequest) {
   const timeout = payload.test ? 120_000 : undefined;
-  const res = await http.post<BatchKeysResponse>("/admin/keys/batch", payload, timeout ? { timeout } : undefined);
+  const res = await http.post<BatchKeysResponse>(
+    "/admin/keys/batch",
+    payload,
+    timeout ? { timeout } : undefined
+  );
   return res.data;
 }

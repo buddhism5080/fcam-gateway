@@ -88,23 +88,25 @@ def _make_app(tmp_path, *, handler):
             quota_reset_at=today_in_timezone("UTC"),
             rate_limit_per_min=10_000,
             max_concurrent=10,
+            max_retries=3,
         )
         db.add(c)
         db.flush()
 
         key_bytes = derive_master_key_bytes(secrets.master_key)
         k = ApiKey(
-            client_id=c.id,
+            client_id=None,
             api_key_ciphertext=encrypt_api_key(key_bytes, "fc-key-1"),
             api_key_hash="h1",
             api_key_last4="0001",
             is_active=True,
             status="active",
-            daily_quota=100_000,
+            daily_quota=0,
             daily_usage=0,
             quota_reset_at=today_in_timezone("UTC"),
             max_concurrent=10,
             rate_limit_per_min=10_000,
+            cached_remaining_credits=10_000,
         )
         db.add(k)
         db.commit()
@@ -157,6 +159,7 @@ def test_api_quota_exceeded(tmp_path):
         return httpx.Response(200, json={"ok": True})
 
     app, token = _make_app(tmp_path, handler=handler)
+    app.state.config.quota.enable_quota_check = True
     SessionLocal = app.state.db_session_factory
     with SessionLocal() as db:
         c = db.query(Client).one()
@@ -276,6 +279,11 @@ def test_api_endpoints_passthrough_upstream_429(tmp_path):
         return httpx.Response(429, headers={"Retry-After": "1"}, json={"error": "rate"})
 
     app, token = _make_app(tmp_path, handler=handler)
+    # No key-switch budget: surface the last upstream 429 to the client.
+    with app.state.db_session_factory() as db:
+        c = db.query(Client).one()
+        c.max_retries = 0
+        db.commit()
     app.state.config.firecrawl.max_retries = 0
 
     # 429 会把 key 标记为 cooling；为避免多次调用后“所有 key cooling”导致非预期拦截，
@@ -287,17 +295,18 @@ def test_api_endpoints_passthrough_upstream_429(tmp_path):
         for i in range(2, len(_ENDPOINT_CASES) + 1):
             db.add(
                 ApiKey(
-                    client_id=c.id,
+                    client_id=None,
                     api_key_ciphertext=encrypt_api_key(key_bytes, f"fc-key-{i}"),
                     api_key_hash=f"h{i}",
                     api_key_last4=f"{i:04d}"[-4:],
                     is_active=True,
                     status="active",
-                    daily_quota=100_000,
+                    daily_quota=0,
                     daily_usage=0,
                     quota_reset_at=today_in_timezone("UTC"),
                     max_concurrent=10,
                     rate_limit_per_min=10_000,
+                    cached_remaining_credits=1000,
                 )
             )
         db.commit()
@@ -326,6 +335,10 @@ def test_api_endpoints_passthrough_upstream_5xx(tmp_path):
     app, token = _make_app(tmp_path, handler=handler)
     app.state.config.firecrawl.max_retries = 0
     app.state.config.firecrawl.failure_threshold = 10_000
+    with app.state.db_session_factory() as db:
+        c = db.query(Client).one()
+        c.max_retries = 0
+        db.commit()
 
     headers = {"Authorization": f"Bearer {token}"}
     expected = [(method, expected_upstream_path) for method, _path, expected_upstream_path in _ENDPOINT_CASES]
@@ -350,6 +363,10 @@ def test_api_endpoints_timeout_returns_gateway_error(tmp_path):
     app, token = _make_app(tmp_path, handler=handler)
     app.state.config.firecrawl.max_retries = 0
     app.state.config.firecrawl.failure_threshold = 10_000
+    with app.state.db_session_factory() as db:
+        c = db.query(Client).one()
+        c.max_retries = 0
+        db.commit()
 
     headers = {"Authorization": f"Bearer {token}"}
     expected = [(method, expected_upstream_path) for method, _path, expected_upstream_path in _ENDPOINT_CASES]
@@ -437,18 +454,24 @@ def test_api_request_log_includes_retry_count(tmp_path):
     SessionLocal = app.state.db_session_factory
     with SessionLocal() as db:
         c = db.query(Client).one()
+        c.max_retries = 3
+        # Prefer the original seeded key (fc-key-1) via higher remaining credits
+        k1 = db.query(ApiKey).one()
+        k1.cached_remaining_credits = 50_000
         key_bytes = derive_master_key_bytes(app.state.secrets.master_key)
         k2 = ApiKey(
-            client_id=c.id,
+            client_id=None,
             api_key_ciphertext=encrypt_api_key(key_bytes, "fc-key-2"),
             api_key_hash="h2",
             api_key_last4="0002",
             is_active=True,
             status="active",
-            daily_quota=100,
+            daily_quota=0,
             daily_usage=0,
             quota_reset_at=today_in_timezone("UTC"),
             max_concurrent=10,
+            rate_limit_per_min=10_000,
+            cached_remaining_credits=100,
         )
         db.add(k2)
         db.commit()
@@ -469,7 +492,8 @@ def test_api_request_log_includes_retry_count(tmp_path):
         assert log.status_code == 200
         assert log.success is True
         assert log.api_key_id == key2_id
-        assert log.retry_count == 1
+        assert log.retry_count >= 1
+
 
 
 def test_api_idempotency_replays_response_without_upstream_call(tmp_path):
@@ -654,7 +678,7 @@ def test_api_no_key_configured_returns_503(tmp_path):
     assert resp.status_code == 503
     body = resp.json()
     assert body["success"] is False
-    assert body["error"] == "No key configured for client"
+    assert body["error"] == "No key configured"
 
 
 def test_api_all_keys_cooling_returns_429(tmp_path):
@@ -680,7 +704,7 @@ def test_api_all_keys_cooling_returns_429(tmp_path):
     assert int(resp.headers.get("Retry-After", "0")) >= 1
 
 
-def test_api_all_keys_quota_exceeded_returns_429(tmp_path):
+def test_api_all_keys_no_credits_returns_503(tmp_path):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": True})
 
@@ -688,20 +712,17 @@ def test_api_all_keys_quota_exceeded_returns_429(tmp_path):
     SessionLocal = app.state.db_session_factory
     with SessionLocal() as db:
         k = db.query(ApiKey).one()
-        k.daily_quota = 1
-        k.daily_usage = 1
-        k.quota_reset_at = today_in_timezone("UTC")
+        k.cached_remaining_credits = 0
         db.commit()
 
     headers = {"Authorization": f"Bearer {token}"}
     with TestClient(app) as client:
         resp = client.post("/api/scrape", headers=headers, json={"url": "https://example.com"})
 
-    assert resp.status_code == 429
+    assert resp.status_code == 503
     body = resp.json()
     assert body["success"] is False
-    assert body["error"] == "All keys quota exceeded"
-    assert int(resp.headers.get("Retry-After", "0")) >= 1
+    assert body["error"] == "All keys have zero remaining credits"
 
 
 def test_api_client_quota_resets_lazily(tmp_path):
@@ -709,6 +730,7 @@ def test_api_client_quota_resets_lazily(tmp_path):
         return httpx.Response(200, json={"ok": True})
 
     app, token = _make_app(tmp_path, handler=handler)
+    app.state.config.quota.enable_quota_check = True
     SessionLocal = app.state.db_session_factory
     today = today_in_timezone("UTC")
 

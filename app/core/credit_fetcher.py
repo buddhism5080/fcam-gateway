@@ -167,8 +167,11 @@ async def fetch_credit_from_firecrawl(
             raise FcamError(status_code=503, code="DB_UNAVAILABLE", message="Database unavailable") from exc
 
     if response.status_code in {401, 403}:
-        key.status = "failed"
+        # Permanently invalid — auto-disable and stop credit refresh forever.
+        key.status = "invalid"
         key.is_active = False
+        key.next_refresh_at = None
+        key.cached_remaining_credits = 0
         snapshot = CreditSnapshot(
             api_key_id=key.id,
             remaining_credits=0,

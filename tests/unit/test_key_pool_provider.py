@@ -77,25 +77,22 @@ def test_select_no_key_for_provider_raises(db, config):
         pool.select(db, config, provider="exa")
 
 
-def test_select_provider_scoped_round_robin(db, config):
-    """Round-robin index should be scoped by provider."""
-    fc1 = _add_key(db, provider="firecrawl", name="fc1")
-    fc2 = _add_key(db, provider="firecrawl", name="fc2")
+def test_select_provider_scoped_selection(db, config):
+    """Selection is provider-scoped; both providers independently selectable."""
+    _add_key(db, provider="firecrawl", name="fc1")
+    _add_key(db, provider="firecrawl", name="fc2")
     _add_key(db, provider="exa", name="exa1")
 
     pool = KeyPool()
 
-    # First firecrawl selection
     r1 = pool.select(db, config, provider="firecrawl")
-    # First exa selection — should start from exa's own index, not firecrawl's
+    assert r1.api_key.provider == "firecrawl"
+
     r_exa = pool.select(db, config, provider="exa")
     assert r_exa.api_key.provider == "exa"
 
-    # Second firecrawl selection should advance firecrawl's index
     r2 = pool.select(db, config, provider="firecrawl")
     assert r2.api_key.provider == "firecrawl"
-    # Should be different from first (round-robin)
-    assert r1.api_key.id != r2.api_key.id or len([fc1, fc2]) == 1
 
 
 def test_select_all_disabled_for_provider(db, config):

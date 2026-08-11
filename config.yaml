@@ -31,15 +31,20 @@ security:
     allowed_paths: ["scrape", "crawl", "search", "agent", "map", "extract", "batch", "browser", "team"]
 
 quota:
-  # 文档冻结：quota.timezone=UTC；quota.count_mode=success
+  # Key daily quota removed. Client daily quota optional (enable_quota_check).
   timezone: "UTC"
   count_mode: "success" # success | attempt
-  default_daily_limit: 5
+  default_daily_limit: 0
   reset_time: "00:00"
-  enable_quota_check: true
+  enable_quota_check: false
 
 rate_limit:
   cooldown_seconds: 60
+
+scheduling:
+  # Scientific key selection: score = log1p(remaining) * 1/(1 + age/half_life)
+  freshness_half_life_seconds: 21600  # 6h
+  unknown_credit_baseline: 50.0
 
 credit_monitoring:
   enabled: true
@@ -56,6 +61,8 @@ credit_monitoring:
 
   batch_size: 10
   batch_delay_seconds: 5
+  # Concurrent refresh workers (thread-like parallelism via asyncio)
+  workers: 4
 
   local_estimation:
     enabled: true

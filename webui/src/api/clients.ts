@@ -10,6 +10,7 @@ export type ClientItem = {
   quota_reset_at: string | null;
   rate_limit_per_min: number;
   max_concurrent: number;
+  max_retries: number;
   created_at: string;
   last_used_at: string | null;
 };
@@ -24,6 +25,7 @@ export type CreateClientRequest = {
   daily_quota?: number | null;
   rate_limit_per_min?: number;
   max_concurrent?: number;
+  max_retries?: number;
   is_active?: boolean;
 };
 
@@ -41,6 +43,7 @@ export type UpdateClientRequest = {
   daily_quota?: number | null;
   rate_limit_per_min?: number | null;
   max_concurrent?: number | null;
+  max_retries?: number | null;
   is_active?: boolean | null;
 };
 
@@ -51,7 +54,7 @@ export async function updateClient(clientId: number, payload: UpdateClientReques
 
 export type BatchClientRequest = {
   client_ids: number[];
-  action: 'enable' | 'disable' | 'delete';
+  action: "enable" | "disable" | "delete";
 };
 
 export type BatchClientResponse = {
@@ -64,6 +67,6 @@ export type BatchClientResponse = {
 };
 
 export async function batchUpdateClients(payload: BatchClientRequest) {
-  const res = await http.patch<BatchClientResponse>('/admin/clients/batch', payload);
+  const res = await http.patch<BatchClientResponse>("/admin/clients/batch", payload);
   return res.data;
 }

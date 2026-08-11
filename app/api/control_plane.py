@@ -151,6 +151,7 @@ def _client_item(client: Client) -> dict[str, Any]:
         "quota_reset_at": _date_to_iso(client.quota_reset_at),
         "rate_limit_per_min": client.rate_limit_per_min,
         "max_concurrent": client.max_concurrent,
+        "max_retries": getattr(client, "max_retries", 3),
         "created_at": _dt_to_rfc3339(client.created_at),
         "last_used_at": _dt_to_rfc3339(client.last_used_at),
     }
@@ -161,12 +162,13 @@ _VALID_PROVIDERS = {"firecrawl", "exa"}
 
 class CreateKeyRequest(BaseModel):
     api_key: str = Field(..., min_length=8)
-    client_id: int | None = Field(default=None, ge=0, description="0 means unassigned")
+    # client_id kept for back-compat but ignored (unified global pool)
+    client_id: int | None = Field(default=None, ge=0, description="Ignored — keys live in a global pool")
     name: str | None = Field(default=None, max_length=255)
     plan_type: str = Field(default="free", max_length=32)
-    daily_quota: int = Field(default=5, ge=0)
-    max_concurrent: int = Field(default=2, ge=0)
-    rate_limit_per_min: int = Field(default=10, ge=0)
+    daily_quota: int = Field(default=0, ge=0, description="Deprecated — not used for scheduling")
+    max_concurrent: int = Field(default=5, ge=0)
+    rate_limit_per_min: int = Field(default=60, ge=0)
     is_active: bool = True
     provider: str = Field(default="firecrawl", max_length=32)
 
@@ -174,10 +176,10 @@ class CreateKeyRequest(BaseModel):
 class UpdateKeyRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
-    client_id: int | None = Field(default=None, ge=0, description="0 means unassigned")
+    client_id: int | None = Field(default=None, ge=0, description="Ignored — keys live in a global pool")
     name: str | None = Field(default=None, max_length=255)
     plan_type: str | None = Field(default=None, max_length=32)
-    daily_quota: int | None = Field(default=None, ge=0)
+    daily_quota: int | None = Field(default=None, ge=0, description="Deprecated")
     max_concurrent: int | None = Field(default=None, ge=0)
     rate_limit_per_min: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
@@ -217,12 +219,12 @@ class BatchKeysRequest(BaseModel):
 
 
 class ImportKeysTextRequest(BaseModel):
-    client_id: int | None = Field(default=None, ge=0, description="0 means unassigned")
+    client_id: int | None = Field(default=None, ge=0, description="Ignored — global pool")
     text: str = Field(..., min_length=1, description="One key per line. Format: user|pass|api_key|verified_at")
     plan_type: str = Field(default="free", max_length=32)
-    daily_quota: int = Field(default=5, ge=0)
-    max_concurrent: int = Field(default=2, ge=0)
-    rate_limit_per_min: int = Field(default=10, ge=0)
+    daily_quota: int = Field(default=0, ge=0)
+    max_concurrent: int = Field(default=5, ge=0)
+    rate_limit_per_min: int = Field(default=60, ge=0)
     is_active: bool = True
     provider: str = Field(default="firecrawl", max_length=32)
 
@@ -232,6 +234,7 @@ class CreateClientRequest(BaseModel):
     daily_quota: int | None = Field(default=None, ge=0)
     rate_limit_per_min: int = Field(default=60, ge=0)
     max_concurrent: int = Field(default=10, ge=0)
+    max_retries: int = Field(default=3, ge=0, le=50, description="Upstream key-switch retries on 429/invalid/credit")
     is_active: bool = True
 
 
@@ -239,6 +242,7 @@ class UpdateClientRequest(BaseModel):
     daily_quota: int | None = Field(default=None, ge=0)
     rate_limit_per_min: int | None = Field(default=None, ge=0)
     max_concurrent: int | None = Field(default=None, ge=0)
+    max_retries: int | None = Field(default=None, ge=0, le=50)
     is_active: bool | None = None
 
 
@@ -397,13 +401,8 @@ def create_key(
             message=f"Invalid provider '{payload.provider}'. Allowed: {', '.join(sorted(_VALID_PROVIDERS))}",
         )
 
+    # Unified global pool: never bind upstream keys to clients.
     client_id: int | None = None
-    if payload.client_id is not None:
-        client_id = None if payload.client_id == 0 else int(payload.client_id)
-        if client_id is not None:
-            exists = db.query(Client.id).filter(Client.id == client_id).one_or_none()
-            if exists is None:
-                raise FcamError(status_code=404, code="NOT_FOUND", message="Client not found")
 
     master_key_bytes = derive_master_key_bytes(secrets.master_key)
     api_key_hash = hmac_sha256_hex(master_key_bytes, payload.api_key)
@@ -422,7 +421,7 @@ def create_key(
         plan_type=payload.plan_type,
         is_active=payload.is_active,
         status=status,
-        daily_quota=payload.daily_quota,
+        daily_quota=0,
         daily_usage=0,
         quota_reset_at=today,
         max_concurrent=payload.max_concurrent,
@@ -465,13 +464,8 @@ def import_keys_text(
             message=f"Invalid provider '{payload.provider}'. Allowed: {', '.join(sorted(_VALID_PROVIDERS))}",
         )
 
+    # Unified global pool — ignore client_id on import.
     client_id: int | None = None
-    if payload.client_id is not None:
-        client_id = None if payload.client_id == 0 else int(payload.client_id)
-        if client_id is not None:
-            exists = db.query(Client.id).filter(Client.id == client_id).one_or_none()
-            if exists is None:
-                raise FcamError(status_code=404, code="NOT_FOUND", message="Client not found")
 
     items, parse_failures = parse_keys_text(payload.text)
     failures: list[dict[str, Any]] = [
@@ -510,7 +504,7 @@ def import_keys_text(
                     plan_type=payload.plan_type,
                     is_active=payload.is_active,
                     status=status,
-                    daily_quota=payload.daily_quota,
+                    daily_quota=0,
                     daily_usage=0,
                     quota_reset_at=today,
                     max_concurrent=payload.max_concurrent,
@@ -636,9 +630,8 @@ def update_key(
     if payload.plan_type is not None:
         key.plan_type = payload.plan_type
     if payload.daily_quota is not None:
+        # Deprecated: kept for API back-compat only; scheduling ignores daily_quota.
         key.daily_quota = payload.daily_quota
-        if key.daily_quota is not None and key.daily_usage >= key.daily_quota:
-            key.status = "quota_exceeded"
     if payload.max_concurrent is not None:
         key.max_concurrent = payload.max_concurrent
     if payload.rate_limit_per_min is not None:
@@ -1048,9 +1041,8 @@ def batch_keys(
                     key.plan_type = patch_data["plan_type"]
                     changed = True
                 if "daily_quota" in patch_data and patch_data["daily_quota"] is not None:
+                    # Deprecated field — accept but do not gate status on it.
                     key.daily_quota = int(patch_data["daily_quota"])
-                    if key.daily_quota is not None and key.daily_usage >= key.daily_quota:
-                        key.status = "quota_exceeded"
                     changed = True
                 if "max_concurrent" in patch_data and patch_data["max_concurrent"] is not None:
                     key.max_concurrent = int(patch_data["max_concurrent"])
@@ -1235,6 +1227,7 @@ def create_client(
         quota_reset_at=today,
         rate_limit_per_min=payload.rate_limit_per_min,
         max_concurrent=payload.max_concurrent,
+        max_retries=payload.max_retries,
     )
 
     try:
@@ -1272,6 +1265,8 @@ def update_client(
         client.rate_limit_per_min = data["rate_limit_per_min"]
     if "max_concurrent" in data:
         client.max_concurrent = data["max_concurrent"]
+    if "max_retries" in data and data["max_retries"] is not None:
+        client.max_retries = int(data["max_retries"])
     if "is_active" in data:
         desired_active = bool(data["is_active"])
         client.is_active = desired_active
@@ -1648,23 +1643,33 @@ def quota_stats(
     include_keys: bool = Query(default=True),
     include_clients: bool = Query(default=False),
 ) -> dict[str, Any]:
+    """Credit-oriented pool stats (daily_quota no longer used for scheduling)."""
     try:
         keys = db.query(ApiKey).all()
-        schedulable = [k for k in keys if k.is_active and k.status != "disabled"]
+        schedulable = [k for k in keys if k.is_active and k.status not in {"disabled", "invalid", "decrypt_failed"}]
 
-        total_quota = sum(int(k.daily_quota or 0) for k in schedulable)
-        used_today = sum(int(k.daily_usage or 0) for k in schedulable)
-        remaining = max(total_quota - used_today, 0)
-
-        keys_exhausted = sum(1 for k in schedulable if k.status == "quota_exceeded")
-        keys_available = sum(1 for k in schedulable if k.status == "active")
+        total_remaining = sum(int(k.cached_remaining_credits or 0) for k in schedulable)
+        total_plan = sum(int(k.cached_plan_credits or 0) for k in schedulable)
+        keys_zero = sum(
+            1
+            for k in schedulable
+            if k.cached_remaining_credits is not None and int(k.cached_remaining_credits) <= 0
+        )
+        keys_available = sum(
+            1
+            for k in schedulable
+            if k.status == "active"
+            and (k.cached_remaining_credits is None or int(k.cached_remaining_credits) > 0)
+        )
 
         body: dict[str, Any] = {
             "summary": {
-                "total_quota": total_quota,
-                "used_today": used_today,
-                "remaining": remaining,
-                "keys_exhausted": keys_exhausted,
+                "total_remaining_credits": total_remaining,
+                "total_plan_credits": total_plan,
+                "total_quota": total_plan,  # back-compat alias
+                "used_today": 0,
+                "remaining": total_remaining,
+                "keys_exhausted": keys_zero,
                 "keys_available": keys_available,
             }
         }
@@ -1675,6 +1680,10 @@ def quota_stats(
                     "id": k.id,
                     "api_key_masked": mask_api_key_last4(k.api_key_last4),
                     "status": k.status,
+                    "cached_remaining_credits": k.cached_remaining_credits,
+                    "cached_plan_credits": k.cached_plan_credits,
+                    "last_credit_check_at": _dt_to_rfc3339(k.last_credit_check_at),
+                    "next_refresh_at": _dt_to_rfc3339(k.next_refresh_at),
                     "daily_quota": k.daily_quota,
                     "daily_usage": k.daily_usage,
                     "quota_reset_at": _date_to_iso(k.quota_reset_at),

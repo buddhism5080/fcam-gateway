@@ -44,14 +44,16 @@ class ApiKey(Base):
     plan_type: Mapped[str] = mapped_column(String(32), nullable=False, default="free")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
-    daily_quota: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    # daily_quota retained for DB back-compat only; scheduling no longer uses it.
+    daily_quota: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     daily_usage: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     quota_reset_at: Mapped[date | None] = mapped_column(Date, nullable=True)
 
-    max_concurrent: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    # Soft per-key gates (optional); primary concurrency/RPM is on Client (downstream).
+    max_concurrent: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     current_concurrent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    rate_limit_per_min: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    rate_limit_per_min: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     rate_limit_reset_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -89,11 +91,14 @@ class Client(Base):
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # Optional client daily quota (off by default). Primary controls: RPM + concurrency + retries.
     daily_quota: Mapped[int | None] = mapped_column(Integer, nullable=True)
     daily_usage: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     quota_reset_at: Mapped[date | None] = mapped_column(Date, nullable=True)
     rate_limit_per_min: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     max_concurrent: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    # How many times to switch upstream keys on 429 / invalid / credit errors before failing client.
+    max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utc_now

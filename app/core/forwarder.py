@@ -105,6 +105,45 @@ def _parse_retry_after(headers: httpx.Headers) -> int | None:
     return max(seconds, 0)
 
 
+_CREDIT_ERROR_MARKERS = (
+    "insufficient credit",
+    "insufficient credits",
+    "no credits",
+    "out of credits",
+    "credit limit",
+    "payment required",
+    "quota exceeded",
+    "not enough credits",
+    "remaining credits",
+)
+
+
+def _looks_like_credit_error(resp: httpx.Response) -> bool:
+    """Detect upstream responses that indicate the selected key is out of credits."""
+    if resp.status_code == 402:
+        return True
+    if resp.status_code not in {400, 402, 403, 429, 402}:
+        # Also scan 4xx bodies that look credit-related
+        if resp.status_code < 400 or resp.status_code >= 500:
+            return False
+    try:
+        text = (resp.text or "").lower()
+    except Exception:
+        return False
+    return any(m in text for m in _CREDIT_ERROR_MARKERS)
+
+
+def _client_retry_budget(client: Client, provider_max: int) -> int:
+    """
+    Total upstream attempts = client.max_retries + 1 (first try + switches).
+    Falls back to provider max_retries when client field missing.
+    """
+    raw = getattr(client, "max_retries", None)
+    if raw is None:
+        return max(int(provider_max), 0) + 1
+    return max(int(raw), 0) + 1
+
+
 def _sanitized_request_headers(in_headers: httpx.Headers, request_id: str) -> dict[str, str]:
     headers: dict[str, str] = {"x-request-id": request_id}
     accept = in_headers.get("accept")
@@ -201,6 +240,7 @@ class Forwarder:
         try:
             key.status = "decrypt_failed"
             key.is_active = False
+            key.next_refresh_at = None
             db.commit()
             logger.warning(
                 "key.decrypt_failed",
@@ -233,12 +273,15 @@ class Forwarder:
 
         last_upstream_status: int | None = None
         last_api_key_id: int | None = None
+        last_error_response: httpx.Response | None = None
 
         headers = httpx.Headers(inbound_headers)
         safe_headers = _sanitized_request_headers(headers, request_id)
 
-        total_attempts = max(self._provider_max_retries(provider), 0) + 1
+        # Per-downstream-client retry budget (key switches on 429 / invalid / credit issues).
+        total_attempts = _client_retry_budget(client, self._provider_max_retries(provider))
         retry_count = 0
+        tried_key_ids: set[int] = set()
 
         with httpx.Client(
             timeout=timeout,
@@ -247,17 +290,13 @@ class Forwarder:
             follow_redirects=False,
         ) as client_http:
             if pinned_api_key_id is not None:
-                # Pinned key mode: used by "sticky" resource bindings (e.g. GET status by job_id).
-                # We must not switch keys here, otherwise upstream may return 404 for resources created by
-                # another key. Still enforce per-key rate-limit and concurrency gates to avoid bypassing
-                # governance when callers provide pinned_api_key_id.
+                # Pinned key mode: sticky resource bindings (e.g. GET status by job_id).
+                # Must not switch keys — upstream resources are key-scoped.
+                # Global pool: pin by id only (no client_id ownership filter).
                 try:
                     pinned_key = (
                         db.query(ApiKey)
-                        .filter(
-                            ApiKey.id == int(pinned_api_key_id),
-                            ApiKey.client_id == client.id,
-                        )
+                        .filter(ApiKey.id == int(pinned_api_key_id))
                         .one_or_none()
                     )
                 except Exception as exc:
@@ -273,10 +312,13 @@ class Forwarder:
                     )
                     raise FcamError(status_code=503, code="DB_UNAVAILABLE", message="Database unavailable") from exc
 
-                if pinned_key is None or (not pinned_key.is_active) or pinned_key.status == "disabled":
+                if pinned_key is None or (not pinned_key.is_active) or pinned_key.status in {
+                    "disabled",
+                    "invalid",
+                    "decrypt_failed",
+                }:
                     pinned_api_key_id = None
                 elif pinned_key.provider != provider:
-                    # Provider mismatch: pinned key belongs to a different provider
                     pinned_api_key_id = None
                 else:
                     last_api_key_id = pinned_key.id
@@ -406,12 +448,15 @@ class Forwarder:
                         if resp.status_code == 429:
                             cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
                             self._mark_cooling(db, pinned_key, cooldown)
-                            return ForwardResult(
-                                response=_to_fastapi_response(resp),
-                                upstream_status_code=last_upstream_status,
-                                api_key_id=last_api_key_id,
-                                retry_count=retry_count,
-                            )
+                            # Pinned: cannot switch keys; retry same key after cooldown mark only once budget
+                            if attempt >= total_attempts - 1:
+                                return ForwardResult(
+                                    response=_to_fastapi_response(resp),
+                                    upstream_status_code=last_upstream_status,
+                                    api_key_id=last_api_key_id,
+                                    retry_count=retry_count,
+                                )
+                            continue
 
                         if resp.status_code in {401, 403}:
                             self._disable_key(db, pinned_key, resp.status_code)
@@ -504,18 +549,33 @@ class Forwarder:
             while upstream_attempts < total_attempts and selection_tries < max_selection_tries:
                 selection_tries += 1
                 try:
-                    selected = self._key_pool.select(db, self._config, client_id=client.id, provider=provider)
+                    # Unified global pool — client_id ignored; exclude already-tried keys.
+                    selected = self._key_pool.select(
+                        db,
+                        self._config,
+                        provider=provider,
+                        exclude_ids=tried_key_ids,
+                    )
                 except FcamError as exc:
                     if decrypt_failed_seen and exc.code in {
                         "NO_KEY_CONFIGURED",
                         "ALL_KEYS_DISABLED",
                         "NO_KEY_AVAILABLE",
+                        "ALL_KEYS_NO_CREDITS",
                     }:
                         raise FcamError(
                             status_code=503,
                             code="KEY_DECRYPT_FAILED",
                             message="Failed to decrypt API key; check FCAM_MASTER_KEY",
                         ) from exc
+                    # If we already have a last error from a previous attempt, surface it
+                    if last_error_response is not None and upstream_attempts > 0:
+                        return ForwardResult(
+                            response=_to_fastapi_response(last_error_response),
+                            upstream_status_code=last_upstream_status,
+                            api_key_id=last_api_key_id,
+                            retry_count=max(retry_count - 1, 0),
+                        )
                     raise
                 key: ApiKey = selected.api_key
                 last_api_key_id = key.id
@@ -537,6 +597,7 @@ class Forwarder:
                         plaintext_api_key = decrypt_api_key(self._master_key, key.api_key_ciphertext)
                     except (InvalidTag, ValueError):
                         decrypt_failed_seen = True
+                        tried_key_ids.add(key.id)
                         self._disable_key_decrypt_failed(db, key)
                         retry_count += 1
                         continue
@@ -607,9 +668,23 @@ class Forwarder:
                 finally:
                     lease.release()
 
-                if resp.status_code == 429:
-                    cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
-                    self._mark_cooling(db, key, cooldown)
+                # --- Auto switch key on 429 / invalid / credit issues (do NOT leak to client yet) ---
+                if resp.status_code == 429 or _looks_like_credit_error(resp):
+                    tried_key_ids.add(key.id)
+                    if resp.status_code == 429 and not _looks_like_credit_error(resp):
+                        cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
+                        self._mark_cooling(db, key, cooldown)
+                    else:
+                        # Credit exhaustion: zero out so scheduler skips this key
+                        try:
+                            key.cached_remaining_credits = 0
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                        if resp.status_code == 429:
+                            cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
+                            self._mark_cooling(db, key, cooldown)
+                    last_error_response = resp
                     retry_count += 1
                     if upstream_attempts >= total_attempts:
                         return ForwardResult(
@@ -621,7 +696,9 @@ class Forwarder:
                     continue
 
                 if resp.status_code in {401, 403}:
+                    tried_key_ids.add(key.id)
                     self._disable_key(db, key, resp.status_code)
+                    last_error_response = resp
                     retry_count += 1
                     if upstream_attempts >= total_attempts:
                         return ForwardResult(
@@ -634,6 +711,7 @@ class Forwarder:
 
                 if resp.status_code >= 500:
                     self._record_failure(db, key, reason="upstream_5xx")
+                    last_error_response = resp
                     retry_count += 1
                     if upstream_attempts >= total_attempts:
                         return ForwardResult(
@@ -719,6 +797,13 @@ class Forwarder:
                     "method": method,
                     "upstream_path": upstream_path,
                 },
+            )
+        if last_error_response is not None:
+            return ForwardResult(
+                response=_to_fastapi_response(last_error_response),
+                upstream_status_code=last_upstream_status,
+                api_key_id=last_api_key_id,
+                retry_count=max(retry_count - 1, 0),
             )
         raise FcamError(
             status_code=503,
@@ -1027,31 +1112,22 @@ class Forwarder:
         )
 
     def _consume_quota_on_success(self, db: Session, client: Client, key: ApiKey) -> None:
+        """Update usage counters. Key daily quota is no longer enforced."""
         try:
             if client.daily_quota is not None:
                 client.daily_usage += 1
             client.last_used_at = datetime.now(timezone.utc)
 
-            key.daily_usage += 1
             key.total_requests += 1
             key.last_used_at = datetime.now(timezone.utc)
-            if key.daily_quota is not None and key.daily_usage >= key.daily_quota:
-                key.status = "quota_exceeded"
 
             db.commit()
-            if self._metrics is not None:
-                if client.daily_quota is not None:
-                    self._metrics.set_quota_remaining(
-                        scope="client",
-                        id=client.id,
-                        remaining=max(int(client.daily_quota) - int(client.daily_usage), 0),
-                    )
-                if key.daily_quota is not None:
-                    self._metrics.set_quota_remaining(
-                        scope="key",
-                        id=key.id,
-                        remaining=max(int(key.daily_quota) - int(key.daily_usage), 0),
-                    )
+            if self._metrics is not None and client.daily_quota is not None:
+                self._metrics.set_quota_remaining(
+                    scope="client",
+                    id=client.id,
+                    remaining=max(int(client.daily_quota) - int(client.daily_usage), 0),
+                )
         except Exception as exc:
             db.rollback()
             logger.exception(
@@ -1097,8 +1173,11 @@ class Forwarder:
 
     def _disable_key(self, db: Session, key: ApiKey, status_code: int) -> None:
         try:
-            key.status = "disabled"
+            # Permanent invalidation — never selected, never credit-refreshed.
+            key.status = "invalid"
             key.is_active = False
+            key.next_refresh_at = None
+            key.cached_remaining_credits = 0
             db.commit()
             logger.info(
                 "key.disabled",
