@@ -99,13 +99,33 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ steps.platforms.outputs.list }}
           push: ${{ github.event_name != 'pull_request' && (github.event.inputs.push || 'true') != 'false' }}
-          load: false
+          load: ${{ github.event_name != 'pull_request' && (github.event.inputs.push || 'true') == 'false' && steps.platforms.outputs.list == 'linux/amd64' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
           sbom: false
+
+      - name: Smoke /healthz (single-arch local load only)
+        if: github.event_name != 'pull_request' && (github.event.inputs.push || 'true') == 'false' && steps.platforms.outputs.list == 'linux/amd64'
+        run: |
+          IMG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          docker run -d --name fcam-smoke -p 18000:8000 \
+            -e FCAM_ADMIN_TOKEN=smoke_admin \
+            -e FCAM_MASTER_KEY=smoke_master_key_32_bytes_minimum____ \
+            "$IMG"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18000/healthz | grep -q ok; then
+              echo "healthz ok"
+              docker rm -f fcam-smoke
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs fcam-smoke || true
+          docker rm -f fcam-smoke
+          exit 1
 
       - name: Summary
         run: |

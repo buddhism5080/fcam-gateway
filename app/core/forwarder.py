@@ -64,6 +64,8 @@ class ForwardResult:
     upstream_status_code: int | None
     api_key_id: int | None
     retry_count: int
+    switch_reasons: list[str] | None = None
+    selection_score: float | None = None
 
 
 @dataclass
@@ -169,6 +171,8 @@ class Forwarder:
         metrics: Metrics | None = None,
         cooldown_store: object | None = None,
         transport: httpx.BaseTransport | None = None,
+        http_pool: object | None = None,
+        runtime_settings: object | None = None,
     ) -> None:
         self._config = config
         self._firecrawl_upstream_base_url, self._firecrawl_upstream_version = _strip_firecrawl_version_suffix(
@@ -181,9 +185,44 @@ class Forwarder:
         self._metrics = metrics
         self._cooldown_store = cooldown_store or NoopCooldownStore()
         self._transport = transport
+        self._runtime_settings = runtime_settings
+
+        # Optional connection pool (default off). When transport is set (tests), pool
+        # always uses ephemeral clients so MockTransport isolation is preserved.
+        if http_pool is not None:
+            self._http_pool = http_pool
+        else:
+            from app.core.http_pool import UpstreamHttpPool
+
+            http_cfg = getattr(getattr(config, "security", None), "http_client", None)
+            self._http_pool = UpstreamHttpPool(
+                enabled=bool(getattr(http_cfg, "connection_pool_enabled", False)),
+                max_connections=int(getattr(http_cfg, "max_connections", 100) or 100),
+                max_keepalive_connections=int(getattr(http_cfg, "max_keepalive_connections", 20) or 20),
+                keepalive_expiry=float(getattr(http_cfg, "keepalive_expiry_seconds", 30.0) or 30.0),
+                transport=transport,
+            )
 
         self._failure_lock = threading.Lock()
         self._failures: dict[int, tuple[int, datetime]] = {}
+
+    def _http_acquire(self, *, base_url: str, timeout: httpx.Timeout):
+        return self._http_pool.acquire(base_url=base_url, timeout=timeout)
+
+    def _record_switch(self, reason: str, switch_reasons: list[str]) -> None:
+        switch_reasons.append(reason)
+        if self._metrics is not None:
+            try:
+                self._metrics.record_key_switch(reason)
+            except Exception:
+                pass
+
+    def _record_upstream_status(self, provider: str, status_code: int) -> None:
+        if self._metrics is not None:
+            try:
+                self._metrics.record_upstream_status(provider=provider, status_code=status_code)
+            except Exception:
+                pass
 
     def _provider_base_url(self, provider: str) -> str:
         """Return the upstream base URL for the given provider."""
@@ -272,12 +311,10 @@ class Forwarder:
         retry_count = 0
         tried_key_ids: set[int] = set()
 
-        with httpx.Client(
-            timeout=timeout,
-            base_url=base_url,
-            transport=self._transport,
-            follow_redirects=False,
-        ) as client_http:
+        switch_reasons: list[str] = []
+        selection_score: float | None = None
+
+        with self._http_acquire(base_url=base_url, timeout=timeout) as client_http:
             if pinned_api_key_id is not None:
                 # Pinned key mode: sticky resource bindings (e.g. GET status by job_id).
                 # Must not switch keys — upstream resources are key-scoped.
@@ -312,7 +349,7 @@ class Forwarder:
                 else:
                     last_api_key_id = pinned_key.id
                     if self._metrics is not None:
-                        self._metrics.record_key_selected(pinned_key.id)
+                        self._metrics.record_key_selected(pinned_key.id, provider=provider)
 
                     for attempt in range(total_attempts):
                         allowed, retry_after = self._key_rate_limiter.allow(
@@ -444,6 +481,8 @@ class Forwarder:
                                     upstream_status_code=last_upstream_status,
                                     api_key_id=last_api_key_id,
                                     retry_count=retry_count,
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
                                 )
                             continue
 
@@ -454,7 +493,9 @@ class Forwarder:
                                 upstream_status_code=last_upstream_status,
                                 api_key_id=last_api_key_id,
                                 retry_count=retry_count,
-                            )
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
+                                )
 
                         if resp.status_code >= 500:
                             self._record_failure(db, pinned_key, reason="upstream_5xx")
@@ -464,6 +505,8 @@ class Forwarder:
                                     upstream_status_code=last_upstream_status,
                                     api_key_id=last_api_key_id,
                                     retry_count=retry_count,
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
                                 )
                             continue
 
@@ -528,7 +571,9 @@ class Forwarder:
                             upstream_status_code=last_upstream_status,
                             api_key_id=last_api_key_id,
                             retry_count=retry_count,
-                        )
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
+                                )
 
             max_selection_tries = max(total_attempts * 20, 50)
             upstream_attempts = 0
@@ -564,12 +609,20 @@ class Forwarder:
                             upstream_status_code=last_upstream_status,
                             api_key_id=last_api_key_id,
                             retry_count=max(retry_count - 1, 0),
-                        )
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
+                                )
                     raise
                 key: ApiKey = selected.api_key
+                selection_score = float(getattr(selected, "score", 0.0) or 0.0)
                 last_api_key_id = key.id
                 if self._metrics is not None:
-                    self._metrics.record_key_selected(key.id)
+                    try:
+                        self._metrics.set_key_score(key.id, selection_score)
+                    except Exception:
+                        pass
+                if self._metrics is not None:
+                    self._metrics.record_key_selected(key.id, provider=provider)
 
                 allowed, _retry_after = self._key_rate_limiter.allow(str(key.id), key.rate_limit_per_min)
                 if not allowed:
@@ -590,6 +643,7 @@ class Forwarder:
                     except (InvalidTag, ValueError):
                         decrypt_failed_seen = True
                         tried_key_ids.add(key.id)
+                        self._record_switch("decrypt_failed", switch_reasons)
                         self._disable_key_decrypt_failed(db, key)
                         retry_count += 1
                         continue
@@ -684,7 +738,9 @@ class Forwarder:
                             upstream_status_code=last_upstream_status,
                             api_key_id=last_api_key_id,
                             retry_count=retry_count - 1,
-                        )
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
+                                )
                     continue
 
                 if resp.status_code in {401, 403}:
@@ -698,7 +754,9 @@ class Forwarder:
                             upstream_status_code=last_upstream_status,
                             api_key_id=last_api_key_id,
                             retry_count=retry_count - 1,
-                        )
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
+                                )
                     continue
 
                 if resp.status_code >= 500:
@@ -711,7 +769,9 @@ class Forwarder:
                             upstream_status_code=last_upstream_status,
                             api_key_id=last_api_key_id,
                             retry_count=retry_count - 1,
-                        )
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
+                                )
                     continue
 
                 credit_changed = False
@@ -775,7 +835,9 @@ class Forwarder:
                     upstream_status_code=last_upstream_status,
                     api_key_id=last_api_key_id,
                     retry_count=retry_count,
-                )
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
+                                )
 
         if upstream_attempts == 0:
             raise FcamError(
@@ -796,7 +858,9 @@ class Forwarder:
                 upstream_status_code=last_upstream_status,
                 api_key_id=last_api_key_id,
                 retry_count=max(retry_count - 1, 0),
-            )
+                                    switch_reasons=switch_reasons,
+                                    selection_score=selection_score,
+                                )
         raise FcamError(
             status_code=503,
             code="UPSTREAM_UNAVAILABLE",
@@ -855,12 +919,7 @@ class Forwarder:
             upstream_headers = dict(headers)
             upstream_headers.update(self._provider_auth_header(provider, plaintext_api_key))
 
-            with httpx.Client(
-                timeout=timeout,
-                base_url=self._provider_base_url(provider),
-                transport=self._transport,
-                follow_redirects=False,
-            ) as client_http:
+            with self._http_acquire(base_url=self._provider_base_url(provider), timeout=timeout) as client_http:
                 candidates = ["/v2/scrape", "/v1/scrape"]
                 if self._firecrawl_upstream_version == "v1":
                     candidates = ["/v1/scrape", "/v2/scrape"]
@@ -1039,12 +1098,7 @@ class Forwarder:
             upstream_headers = dict(headers)
             upstream_headers.update(self._provider_auth_header(provider, plaintext_api_key))
 
-            with httpx.Client(
-                timeout=timeout,
-                base_url=self._provider_base_url(provider),
-                transport=self._transport,
-                follow_redirects=False,
-            ) as client_http:
+            with self._http_acquire(base_url=self._provider_base_url(provider), timeout=timeout) as client_http:
                 resp = client_http.request(
                     method="POST",
                     url="/search",

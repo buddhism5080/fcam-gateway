@@ -185,7 +185,18 @@ def _persist_request_log(request: Request, *, status_code: int | None, response_
     retry_count = int(getattr(request.state, "retry_count", 0) or 0)
     idempotency_key = request.headers.get("x-idempotency-key")
     error_code = getattr(request.state, "error_code", None)
-    error_details = _dump_error_details(getattr(request.state, "error_details", None))
+    raw_details = getattr(request.state, "error_details", None)
+    if not isinstance(raw_details, dict):
+        raw_details = {} if raw_details is None else {"value": raw_details}
+    else:
+        raw_details = dict(raw_details)
+    switch_reasons = getattr(request.state, "switch_reasons", None)
+    selection_score = getattr(request.state, "selection_score", None)
+    if switch_reasons:
+        raw_details["switch_reasons"] = list(switch_reasons)
+    if selection_score is not None:
+        raw_details["selection_score"] = selection_score
+    error_details = _dump_error_details(raw_details if raw_details else None)
 
     success = None
     if status_code is not None:
@@ -304,11 +315,50 @@ class FcamErrorMiddleware(BaseHTTPMiddleware):
 
 
 class RequestLimitsMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, *, max_body_bytes: int, allowed_api_paths: set[str], allowed_exa_paths: set[str] | None = None):
+    def __init__(
+        self,
+        app,
+        *,
+        max_body_bytes: int,
+        allowed_api_paths: set[str],
+        allowed_exa_paths: set[str] | None = None,
+        stream_body_limit: bool = True,
+    ):
         super().__init__(app)
         self._max_body_bytes = max_body_bytes
         self._allowed_api_paths = {p.strip("/") for p in allowed_api_paths}
         self._allowed_exa_paths = {p.strip("/") for p in (allowed_exa_paths or set())}
+        self._stream_body_limit = bool(stream_body_limit)
+
+    async def _read_body_limited(self, request: Request) -> bytes:
+        """Read body with a hard cap — works with or without Content-Length."""
+        max_b = self._max_body_bytes
+        if not self._stream_body_limit:
+            body = await request.body()
+            if len(body) > max_b:
+                raise FcamError(
+                    status_code=413,
+                    code="REQUEST_TOO_LARGE",
+                    message="Request body too large",
+                    details={"max_body_bytes": max_b},
+                )
+            return body
+
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_b:
+                raise FcamError(
+                    status_code=413,
+                    code="REQUEST_TOO_LARGE",
+                    message="Request body too large",
+                    details={"max_body_bytes": max_b},
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         path = request.url.path
@@ -352,20 +402,10 @@ class RequestLimitsMiddleware(BaseHTTPMiddleware):
                         details={"max_body_bytes": self._max_body_bytes},
                     )
 
-            body = await request.body()
+            body = await self._read_body_limited(request)
             if not body:
                 return await call_next(request)
 
-            if len(body) > self._max_body_bytes:
-                raise FcamError(
-                    status_code=413,
-                    code="REQUEST_TOO_LARGE",
-                    message="Request body too large",
-                    details={"max_body_bytes": self._max_body_bytes},
-                )
-
-            # Only proxy data-plane requires JSON. Admin/control plane is also JSON in practice,
-            # but keep the content-type gate focused on client-facing proxy paths.
             if is_proxy:
                 content_type = request.headers.get("content-type", "")
                 if "application/json" not in content_type:
@@ -374,5 +414,9 @@ class RequestLimitsMiddleware(BaseHTTPMiddleware):
                         code="UNSUPPORTED_MEDIA_TYPE",
                         message="Only application/json is supported",
                     )
+
+            # Cache on the *same* Request instance. Replacing Request breaks
+            # BaseHTTPMiddleware/TestClient body propagation (body Field required).
+            request._body = body  # type: ignore[attr-defined]
 
         return await call_next(request)

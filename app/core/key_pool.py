@@ -101,10 +101,11 @@ class KeyPool:
     Zero-credit and disabled/invalid keys are never selected.
     """
 
-    def __init__(self, *, cooldown_store: object | None = None) -> None:
+    def __init__(self, *, cooldown_store: object | None = None, runtime_settings: object | None = None) -> None:
         self._lock = threading.Lock()
         self._cooldown_store = cooldown_store or NoopCooldownStore()
         self._rng = random.Random()
+        self._runtime_settings = runtime_settings
 
     def select(
         self,
@@ -137,24 +138,18 @@ class KeyPool:
         if not any_active:
             raise FcamError(status_code=503, code="ALL_KEYS_DISABLED", message="All keys disabled")
 
-        half_life = float(
-            getattr(
-                getattr(config, "scheduling", None),
-                "freshness_half_life_seconds",
-                6 * 3600,
-            )
-            if getattr(config, "scheduling", None) is not None
-            else 6 * 3600
+        cfg_half = int(
+            getattr(getattr(config, "scheduling", None), "freshness_half_life_seconds", 6 * 3600) or 6 * 3600
         )
-        unknown_baseline = float(
-            getattr(
-                getattr(config, "scheduling", None),
-                "unknown_credit_baseline",
-                50.0,
-            )
-            if getattr(config, "scheduling", None) is not None
-            else 50.0
+        cfg_base = float(
+            getattr(getattr(config, "scheduling", None), "unknown_credit_baseline", 50.0) or 50.0
         )
+        if self._runtime_settings is not None and hasattr(self._runtime_settings, "effective_half_life"):
+            half_life = float(self._runtime_settings.effective_half_life(cfg_half))
+            unknown_baseline = float(self._runtime_settings.effective_unknown_baseline(cfg_base))
+        else:
+            half_life = float(cfg_half)
+            unknown_baseline = float(cfg_base)
 
         cooling_retry_after: int | None = None
         cooling_seen = 0

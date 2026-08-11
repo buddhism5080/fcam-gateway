@@ -50,6 +50,23 @@ def require_admin(request: Request, secrets: Secrets = Depends(get_secrets)) -> 
     if not secrets.admin_token:
         raise FcamError(status_code=503, code="NOT_READY", message="Admin token not configured")
 
+    # Optional IP allowlist (constant-time token check still required below).
+    config: AppConfig = request.app.state.config
+    allowlist = list(getattr(getattr(config.security, "admin", None), "ip_allowlist", None) or [])
+    if allowlist:
+        client_host = getattr(getattr(request, "client", None), "host", None) or ""
+        # When trust_proxy_headers is on, prefer X-Forwarded-For left-most hop.
+        if config.server.trust_proxy_headers:
+            xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+            if xff:
+                client_host = xff
+        if client_host not in set(allowlist):
+            raise FcamError(
+                status_code=403,
+                code="ADMIN_FORBIDDEN",
+                message="Admin access denied from this address",
+            )
+
     token = _bearer_token(request.headers.get("authorization"))
     if not token or not constant_time_equals(token, secrets.admin_token):
         raise FcamError(status_code=401, code="ADMIN_UNAUTHORIZED", message="Missing or invalid admin token")

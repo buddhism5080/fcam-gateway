@@ -60,6 +60,8 @@ def exa_search(
     )
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     request.state.endpoint = "exa_search"
     return result.response
 
@@ -83,6 +85,8 @@ def exa_find_similar(
     )
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     request.state.endpoint = "exa_findSimilar"
     return result.response
 
@@ -106,6 +110,8 @@ def exa_contents(
     )
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     request.state.endpoint = "exa_contents"
     return result.response
 
@@ -129,5 +135,7 @@ def exa_answer(
     )
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     request.state.endpoint = "exa_answer"
     return result.response

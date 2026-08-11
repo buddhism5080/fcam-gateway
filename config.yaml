@@ -24,11 +24,21 @@ security:
     scheme: "bearer" # bearer | mtls（MVP 默认 bearer）
   admin:
     token_env: "FCAM_ADMIN_TOKEN"
+    # Optional: restrict /admin to these IPs (empty = allow all). Example: ["127.0.0.1", "10.0.0.5"]
+    ip_allowlist: []
   key_encryption:
     master_key_env: "FCAM_MASTER_KEY"
   request_limits:
     max_body_bytes: 1048576 # 1MB
+    stream_body_limit: true
     allowed_paths: ["scrape", "crawl", "search", "agent", "map", "extract", "batch", "browser", "team"]
+  http_client:
+    # Connection reuse for upstream Firecrawl/Exa. Default OFF (safe / legacy behaviour).
+    # Enable under high QPS: connection_pool_enabled: true
+    connection_pool_enabled: false
+    max_connections: 100
+    max_keepalive_connections: 20
+    keepalive_expiry_seconds: 30
 
 quota:
   # Key daily quota removed. Client daily quota optional (enable_quota_check).

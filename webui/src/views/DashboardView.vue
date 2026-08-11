@@ -1,15 +1,35 @@
 <script setup lang="ts">
-import { NAlert, NButton, NCard, NGrid, NGridItem, NSelect, NSpace, NSpin, NTag, useMessage } from "naive-ui";
-import { computed, onMounted, ref, watch } from "vue";
+import {
+  NAlert,
+  NButton,
+  NCard,
+  NDataTable,
+  NForm,
+  NFormItem,
+  NGrid,
+  NGridItem,
+  NInputNumber,
+  NSelect,
+  NSpace,
+  NSpin,
+  NTag,
+  useMessage,
+} from "naive-ui";
+import { computed, h, onMounted, reactive, ref, watch } from "vue";
 
 import { fetchClients, type ClientItem } from "@/api/clients";
 import {
+  fetchClientUsage,
   fetchDashboardChart,
   fetchDashboardStats,
   fetchEncryptionStatus,
+  fetchRuntimeScheduling,
+  updateRuntimeScheduling,
+  type ClientUsageItem,
   type DashboardChart,
   type DashboardStats,
   type EncryptionStatus,
+  type RuntimeScheduling,
 } from "@/api/dashboard";
 import RequestTrendChart from "@/components/RequestTrendChart.vue";
 import StatCard from "@/components/StatCard.vue";
@@ -22,11 +42,20 @@ const loading = ref(false);
 const encryption = ref<EncryptionStatus | null>(null);
 const stats = ref<DashboardStats | null>(null);
 const chart = ref<DashboardChart | null>(null);
+const clientUsage = ref<ClientUsageItem[]>([]);
+const runtime = ref<RuntimeScheduling | null>(null);
+const runtimeSaving = ref(false);
 
 const clients = ref<ClientItem[]>([]);
 const selectedClientId = ref<number>(0);
 
 const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+
+const runtimeForm = reactive({
+  freshness_half_life_seconds: 21600,
+  unknown_credit_baseline: 50,
+  credit_workers: 4,
+});
 
 const clientOptions = computed(() => [
   { label: "全部 Clients", value: 0 },
@@ -42,6 +71,24 @@ const chartTotals = computed(() => {
   return totals;
 });
 
+const usageColumns = [
+  { title: "Client", key: "name", render: (r: ClientUsageItem) => `${r.name} (#${r.id})` },
+  { title: "RPM", key: "rate_limit_per_min", width: 80 },
+  { title: "并发", key: "max_concurrent", width: 70 },
+  { title: "换Key重试", key: "max_retries", width: 90 },
+  { title: "24h请求", key: "requests.total", width: 90, render: (r: ClientUsageItem) => r.requests.total },
+  { title: "成功", key: "requests.success", width: 80, render: (r: ClientUsageItem) => r.requests.success },
+  { title: "失败", key: "requests.failed", width: 80, render: (r: ClientUsageItem) => r.requests.failed },
+  { title: "429", key: "requests.rate_limited", width: 70, render: (r: ClientUsageItem) => r.requests.rate_limited },
+  { title: "重试合计", key: "requests.retry_sum", width: 90, render: (r: ClientUsageItem) => r.requests.retry_sum },
+  {
+    title: "错误率",
+    key: "requests.error_rate",
+    width: 90,
+    render: (r: ClientUsageItem) => `${r.requests.error_rate.toFixed(2)}%`,
+  },
+];
+
 async function loadAll() {
   if (!adminToken.value) return;
   loading.value = true;
@@ -50,6 +97,14 @@ async function loadAll() {
     encryption.value = await fetchEncryptionStatus();
     stats.value = await fetchDashboardStats(clientId);
     chart.value = await fetchDashboardChart({ tz, clientId });
+    const usage = await fetchClientUsage(24);
+    clientUsage.value = usage.items || [];
+    runtime.value = await fetchRuntimeScheduling();
+    if (runtime.value) {
+      runtimeForm.freshness_half_life_seconds = runtime.value.effective.freshness_half_life_seconds;
+      runtimeForm.unknown_credit_baseline = runtime.value.effective.unknown_credit_baseline;
+      runtimeForm.credit_workers = runtime.value.effective.credit_workers;
+    }
   } catch (err: unknown) {
     message.error(getFcamErrorMessage(err), { duration: 5000 });
   } finally {
@@ -57,9 +112,24 @@ async function loadAll() {
   }
 }
 
+async function onSaveRuntime() {
+  runtimeSaving.value = true;
+  try {
+    runtime.value = await updateRuntimeScheduling({
+      freshness_half_life_seconds: runtimeForm.freshness_half_life_seconds,
+      unknown_credit_baseline: runtimeForm.unknown_credit_baseline,
+      credit_workers: runtimeForm.credit_workers,
+    });
+    message.success("调度参数已热更新（无需重启）");
+  } catch (err: unknown) {
+    message.error(getFcamErrorMessage(err));
+  } finally {
+    runtimeSaving.value = false;
+  }
+}
+
 onMounted(async () => {
   if (adminToken.value) await verifyAdminToken();
-
   if (!adminToken.value) return;
   try {
     clients.value = (await fetchClients()).filter((c) => c.is_active);
@@ -75,10 +145,11 @@ watch(adminToken, async (token) => {
     stats.value = null;
     chart.value = null;
     clients.value = [];
+    clientUsage.value = [];
+    runtime.value = null;
     selectedClientId.value = 0;
     return;
   }
-
   await verifyAdminToken();
   try {
     clients.value = (await fetchClients()).filter((c) => c.is_active);
@@ -126,7 +197,7 @@ watch(selectedClientId, async () => {
       </n-space>
     </n-card>
 
-  <n-spin :show="loading">
+    <n-spin :show="loading">
       <n-grid cols="2 s:4" :x-gap="12" :y-gap="12" responsive="screen">
         <n-grid-item>
           <stat-card
@@ -136,11 +207,9 @@ watch(selectedClientId, async () => {
             accent="primary"
           />
         </n-grid-item>
-
         <n-grid-item>
           <stat-card title="Clients 数量" :value="stats?.clients.total ?? '-'" accent="neutral" />
         </n-grid-item>
-
         <n-grid-item>
           <stat-card
             title="24 小时请求"
@@ -153,7 +222,6 @@ watch(selectedClientId, async () => {
             accent="success"
           />
         </n-grid-item>
-
         <n-grid-item>
           <stat-card
             title="24 小时错误率"
@@ -172,12 +240,38 @@ watch(selectedClientId, async () => {
             <span class="mono muted" style="font-size: 12px">tz={{ tz }}</span>
           </n-space>
         </template>
-        <request-trend-chart
-          v-if="chart"
-          :labels="chart.labels"
-          :datasets="chart.datasets"
-        />
+        <request-trend-chart v-if="chart" :labels="chart.labels" :datasets="chart.datasets" />
         <div v-else class="muted" style="font-size: 13px">暂无数据</div>
+      </n-card>
+
+      <n-card style="margin-top: 12px" title="下游 Client 用量（24h）" size="small">
+        <n-data-table :columns="usageColumns as any" :data="clientUsage" size="small" :bordered="false" />
+      </n-card>
+
+      <n-card style="margin-top: 12px" title="运行时调度参数（热更新，无需重启）" size="small">
+        <template #header-extra>
+          <n-tag size="small" :type="runtime?.http_connection_pool_enabled ? 'success' : 'default'">
+            HTTP 连接池：{{ runtime?.http_connection_pool_enabled ? "开" : "关(默认)" }}
+          </n-tag>
+        </template>
+        <n-form label-placement="left" label-width="180">
+          <n-form-item label="freshness half-life (s)">
+            <n-input-number v-model:value="runtimeForm.freshness_half_life_seconds" :min="60" :max="604800" />
+          </n-form-item>
+          <n-form-item label="unknown credit baseline">
+            <n-input-number v-model:value="runtimeForm.unknown_credit_baseline" :min="0" :max="1000000" />
+          </n-form-item>
+          <n-form-item label="credit refresh workers">
+            <n-input-number v-model:value="runtimeForm.credit_workers" :min="1" :max="64" />
+          </n-form-item>
+          <n-space>
+            <n-button type="primary" :loading="runtimeSaving" @click="onSaveRuntime">应用</n-button>
+            <span class="muted" style="font-size: 12px">
+              连接池需改 config / 环境变量
+              <code>FCAM_SECURITY__HTTP_CLIENT__CONNECTION_POOL_ENABLED=true</code> 后重启
+            </span>
+          </n-space>
+        </n-form>
       </n-card>
     </n-spin>
   </n-space>

@@ -99,6 +99,26 @@ def _key_item(key: ApiKey, *, request: Request) -> dict[str, Any]:
     elif key.cached_remaining_credits is not None:
         cached_total_credits = int(key.cached_remaining_credits)
 
+    from app.core.key_pool import score_key
+    from app.core.time import now_utc
+
+    now = now_utc()
+    cfg = request.app.state.config
+    runtime = getattr(request.app.state, "runtime_settings", None)
+    half = int(getattr(cfg.scheduling, "freshness_half_life_seconds", 21600) or 21600)
+    base = float(getattr(cfg.scheduling, "unknown_credit_baseline", 50.0) or 50.0)
+    if runtime is not None:
+        half = int(runtime.effective_half_life(half))
+        base = float(runtime.effective_unknown_baseline(base))
+    sel_score = score_key(key, now, freshness_half_life_seconds=half, unknown_credit_baseline=base)
+    credit_age = None
+    if key.last_credit_check_at is not None:
+        lc = key.last_credit_check_at
+        if lc.tzinfo is None:
+            from datetime import timezone as _tz
+            lc = lc.replace(tzinfo=_tz.utc)
+        credit_age = max(int((now - lc).total_seconds()), 0)
+
     return {
         "id": key.id,
         "client_id": key.client_id,
@@ -126,6 +146,8 @@ def _key_item(key: ApiKey, *, request: Request) -> dict[str, Any]:
         "cached_total_credits": cached_total_credits,
         "next_refresh_at": _dt_to_rfc3339(key.next_refresh_at),
         "provider": key.provider,
+        "selection_score": sel_score,
+        "credit_age_seconds": credit_age,
     }
 
 
@@ -1848,3 +1870,198 @@ def query_audit_logs(
     ]
     next_cursor = items[-1]["id"] if (has_more and items) else None
     return {"items": items, "next_cursor": next_cursor, "has_more": has_more}
+
+
+
+class ReviveKeyRequest(BaseModel):
+    test: bool = Field(default=True, description="Run upstream key test after revive")
+    requeue_refresh: bool = Field(default=True, description="Set next_refresh_at=now")
+    model_config = {"extra": "forbid"}
+
+
+@router.post("/keys/{key_id}/revive")
+def revive_key(
+    request: Request,
+    key_id: int,
+    payload: ReviveKeyRequest = Body(default_factory=ReviveKeyRequest),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Re-enable an invalid/disabled/decrypt_failed key and optionally test + requeue refresh."""
+    key = db.query(ApiKey).filter(ApiKey.id == key_id).one_or_none()
+    if key is None:
+        raise FcamError(status_code=404, code="NOT_FOUND", message="Not found")
+
+    key.is_active = True
+    key.status = "active"
+    key.cooldown_until = None
+    if payload.requeue_refresh:
+        key.next_refresh_at = datetime.now(timezone.utc)
+    # Clear zero-credit lock only if explicitly unknown; keep cached values for scheduling.
+    try:
+        db.commit()
+        db.refresh(key)
+    except Exception as exc:
+        db.rollback()
+        raise FcamError(status_code=503, code="DB_UNAVAILABLE", message="Database unavailable") from exc
+
+    test_result = None
+    if payload.test:
+        try:
+            result = request.app.state.forwarder.test_key(
+                db=db,
+                request_id=getattr(request.state, "request_id", "-"),
+                key=key,
+                mode="scrape",
+            )
+            db.commit()
+            db.refresh(key)
+            test_result = {
+                "ok": result.ok,
+                "upstream_status_code": result.upstream_status_code,
+                "latency_ms": result.latency_ms,
+                "observed_status": result.observed_status,
+            }
+        except FcamError:
+            raise
+        except Exception as exc:
+            db.rollback()
+            logger.exception("admin.key_revive_test_failed", extra={"fields": {"api_key_id": key_id}})
+            raise FcamError(status_code=503, code="UPSTREAM_UNAVAILABLE", message="Upstream unavailable") from exc
+
+    _audit(db, request=request, action="key.revive", resource_type=f"api_key:{key.provider}", resource_id=str(key.id))
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    body = _key_item(key, request=request)
+    body["test"] = test_result
+    return body
+
+
+class RuntimeSchedulingUpdate(BaseModel):
+    freshness_half_life_seconds: int | None = Field(default=None, ge=1, le=7 * 24 * 3600)
+    unknown_credit_baseline: float | None = Field(default=None, ge=0, le=1_000_000)
+    credit_workers: int | None = Field(default=None, ge=1, le=64)
+    clear_credit_workers_override: bool = False
+    model_config = {"extra": "forbid"}
+
+
+@router.get("/runtime/scheduling")
+def get_runtime_scheduling(request: Request) -> dict[str, Any]:
+    cfg = request.app.state.config
+    runtime = getattr(request.app.state, "runtime_settings", None)
+    file_half = int(cfg.scheduling.freshness_half_life_seconds)
+    file_base = float(cfg.scheduling.unknown_credit_baseline)
+    file_workers = int(cfg.credit_monitoring.workers)
+    if runtime is None:
+        return {
+            "file": {
+                "freshness_half_life_seconds": file_half,
+                "unknown_credit_baseline": file_base,
+                "credit_workers": file_workers,
+            },
+            "effective": {
+                "freshness_half_life_seconds": file_half,
+                "unknown_credit_baseline": file_base,
+                "credit_workers": file_workers,
+            },
+            "overrides": {},
+            "http_connection_pool_enabled": bool(cfg.security.http_client.connection_pool_enabled),
+        }
+    rs = runtime.get_scheduling()
+    return {
+        "file": {
+            "freshness_half_life_seconds": file_half,
+            "unknown_credit_baseline": file_base,
+            "credit_workers": file_workers,
+        },
+        "effective": {
+            "freshness_half_life_seconds": int(runtime.effective_half_life(file_half)),
+            "unknown_credit_baseline": float(runtime.effective_unknown_baseline(file_base)),
+            "credit_workers": int(runtime.effective_credit_workers(file_workers)),
+        },
+        "overrides": {
+            "freshness_half_life_seconds": rs.freshness_half_life_seconds,
+            "unknown_credit_baseline": rs.unknown_credit_baseline,
+            "credit_workers": rs.credit_workers,
+        },
+        "http_connection_pool_enabled": bool(cfg.security.http_client.connection_pool_enabled),
+    }
+
+
+@router.put("/runtime/scheduling")
+def put_runtime_scheduling(
+    request: Request,
+    payload: RuntimeSchedulingUpdate = Body(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    runtime = getattr(request.app.state, "runtime_settings", None)
+    if runtime is None:
+        raise FcamError(status_code=503, code="NOT_READY", message="Runtime settings not available")
+    runtime.patch_scheduling(
+        freshness_half_life_seconds=payload.freshness_half_life_seconds,
+        unknown_credit_baseline=payload.unknown_credit_baseline,
+        credit_workers=payload.credit_workers,
+        unset_credit_workers=bool(payload.clear_credit_workers_override),
+    )
+    _audit(db, request=request, action="runtime.scheduling.update", resource_type="runtime", resource_id="scheduling")
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+    return get_runtime_scheduling(request)
+
+
+@router.get("/dashboard/clients")
+def dashboard_clients_usage(
+    db: Session = Depends(get_db),
+    hours: int = Query(default=24, ge=1, le=168),
+) -> dict[str, Any]:
+    """Per-client usage for the last N hours (success/fail/429-ish/retries)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    try:
+        clients = (
+            db.query(Client)
+            .filter(Client.status != "deleted")
+            .order_by(Client.id.asc())
+            .all()
+        )
+        rows = []
+        for c in clients:
+            logs = (
+                db.query(RequestLog)
+                .filter(RequestLog.client_id == c.id, RequestLog.created_at >= cutoff)
+                .all()
+            )
+            total = len(logs)
+            failed = sum(1 for r in logs if r.success is False or (r.status_code is not None and int(r.status_code) >= 400))
+            retries = sum(int(r.retry_count or 0) for r in logs)
+            rate_limited = sum(1 for r in logs if r.status_code == 429)
+            rows.append(
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "is_active": c.is_active,
+                    "status": c.status,
+                    "rate_limit_per_min": c.rate_limit_per_min,
+                    "max_concurrent": c.max_concurrent,
+                    "max_retries": getattr(c, "max_retries", 3),
+                    "daily_quota": c.daily_quota,
+                    "daily_usage": c.daily_usage,
+                    "requests": {
+                        "total": total,
+                        "failed": failed,
+                        "success": max(total - failed, 0),
+                        "rate_limited": rate_limited,
+                        "retry_sum": retries,
+                        "error_rate": round((failed / total * 100.0), 3) if total else 0.0,
+                    },
+                }
+            )
+        rows.sort(key=lambda r: r["requests"]["total"], reverse=True)
+    except Exception as exc:
+        logger.exception("db.dashboard_clients_failed")
+        raise FcamError(status_code=503, code="DB_UNAVAILABLE", message="Database unavailable") from exc
+
+    return {"hours": hours, "items": rows}

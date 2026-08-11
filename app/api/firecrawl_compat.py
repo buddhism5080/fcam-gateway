@@ -41,6 +41,8 @@ def scrape(
     )
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     request.state.endpoint = "scrape"
     return result.response
 
@@ -77,6 +79,8 @@ def crawl(
     )
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     idempotency_complete(db=db, config=request.app.state.config, ctx=ctx, response=result.response)
     return result.response
 
@@ -99,6 +103,8 @@ def crawl_status(
     )
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     request.state.endpoint = "crawl_status"
     return result.response
 
@@ -121,6 +127,8 @@ def search(
     )
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     request.state.endpoint = "search"
     return result.response
 
@@ -168,6 +176,8 @@ def agent(
         )
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     idempotency_complete(db=db, config=request.app.state.config, ctx=ctx, response=result.response)
     return result.response
 

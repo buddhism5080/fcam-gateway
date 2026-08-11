@@ -30,6 +30,8 @@ export type KeyItem = {
   billing_period_end?: string | null;
   next_refresh_at: string | null;
   provider: string;
+  selection_score?: number | null;
+  credit_age_seconds?: number | null;
 };
 
 export type Pagination = {
@@ -135,6 +137,18 @@ export async function testKey(keyId: number, payload?: TestKeyRequest) {
   const res = await http.post<TestKeyResponse>(`/admin/keys/${keyId}/test`, payload || {}, {
     timeout: 60_000,
   });
+  return res.data;
+}
+
+export async function reviveKey(
+  keyId: number,
+  payload: { test?: boolean; requeue_refresh?: boolean } = { test: true, requeue_refresh: true },
+) {
+  const res = await http.post<KeyItem & { test?: TestKeyResponse | null }>(
+    `/admin/keys/${keyId}/revive`,
+    payload,
+    { timeout: 60_000 },
+  );
   return res.data;
 }
 

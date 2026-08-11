@@ -38,6 +38,7 @@ async def start_credit_refresh_scheduler(app: FastAPI) -> None:
             master_key=master_key_bytes,
             config=config,
             stop_event=stop_event,
+            runtime_settings=getattr(app.state, "runtime_settings", None),
         )
     )
     app.state.credit_refresh_stop_event = stop_event

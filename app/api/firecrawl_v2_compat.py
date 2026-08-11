@@ -127,6 +127,8 @@ def _forward_with_fallback(
 
     request.state.api_key_id = result.api_key_id
     request.state.retry_count = result.retry_count
+    request.state.switch_reasons = getattr(result, "switch_reasons", None)
+    request.state.selection_score = getattr(result, "selection_score", None)
     return result.response
 
 

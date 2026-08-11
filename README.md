@@ -39,28 +39,44 @@ Firecrawl API Manager 是一个轻量级 HTTP 网关，用于集中管理多个 
 
 ## 快速开始
 
-### 使用 Docker（推荐）
+### 使用 Docker（推荐 · GHCR）
 
 ```bash
-# 1. 创建配置文件
+# 镜像（fork 构建）
+#   ghcr.io/buddhism5080/firecrawl-manger:latest
+#   ghcr.io/buddhism5080/firecrawl-manger:sha-<short>
+#   ghcr.io/buddhism5080/firecrawl-manger:vX.Y.Z   # git tag 触发
+
+docker pull ghcr.io/buddhism5080/firecrawl-manger:latest
+
 cat > .env <<EOF
 FCAM_ADMIN_TOKEN=your_secure_admin_token_here
 FCAM_MASTER_KEY=your_32_bytes_master_key_here____
+# 可选：高 QPS 开启上游连接池（默认关）
+# FCAM_SECURITY__HTTP_CLIENT__CONNECTION_POOL_ENABLED=true
+# 多实例必须 Redis：
+# FCAM_STATE__MODE=redis
+# FCAM_STATE__REDIS__URL=redis://redis:6379/0
 EOF
 
-# 2. 启动服务
 docker run -d \
   --name fcam \
   -p 8000:8000 \
   -v fcam_data:/app/data \
   --env-file .env \
-  guangshanshui/firecrawl-manager:latest
+  ghcr.io/buddhism5080/firecrawl-manger:latest
 
-# 3. 访问服务
 # WebUI: http://localhost:8000/ui2/
-# API Docs: http://localhost:8000/docs
-# Health Check: http://localhost:8000/healthz
+# Health: http://localhost:8000/healthz
 ```
+
+### 控制面安全建议
+
+- Admin token 使用 **constant-time** 比对（已内置）
+- 生产将控制面与数据面拆分端口（见 `docker compose --profile prod`）
+- 可选 IP 白名单：`security.admin.ip_allowlist: ["10.0.0.5"]` 或
+  `FCAM_SECURITY__ADMIN__IP_ALLOWLIST='["10.0.0.5"]'`
+- `trust_proxy_headers: true` 时白名单读取 `X-Forwarded-For`
 
 ### 使用 Docker Compose
 

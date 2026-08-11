@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish release notes for (optional)"
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          body: |
+            ## Docker image
+
+            Multi-arch image is built by the **Docker** workflow on this tag.
+
+            ```bash
+            docker pull ${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.name }}
+            # or semver without v-prefix if metadata maps it:
+            docker pull ${{ steps.tag.outputs.image }}:latest   # only on default branch builds
+            ```
+
+            ### Run
+
+            ```bash
+            docker run -d --name fcam -p 8000:8000 \
+              -e FCAM_ADMIN_TOKEN=... \
+              -e FCAM_MASTER_KEY=... \
+              -v fcam_data:/app/data \
+              ${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.name }}
+            ```
+
+            Health: `GET /healthz` · WebUI: `/ui2/`
+
+            ### Notes
+            - Upstream HTTP connection pool is **off by default**; enable with
+              `FCAM_SECURITY__HTTP_CLIENT__CONNECTION_POOL_ENABLED=true`
+            - Multi-instance: set `FCAM_STATE__MODE=redis` and `FCAM_STATE__REDIS__URL=...`
+            - Admin IP allowlist: `security.admin.ip_allowlist` in config.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

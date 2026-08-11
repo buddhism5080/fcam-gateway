@@ -41,6 +41,9 @@ class ClientAuthConfig(BaseModel):
 
 class AdminSecurityConfig(BaseModel):
     token_env: str = "FCAM_ADMIN_TOKEN"
+    # When non-empty, only these client IPs may call /admin/* (after proxy trust rules).
+    # Empty list = no IP restriction (default).
+    ip_allowlist: list[str] = Field(default_factory=list)
 
 
 class KeyEncryptionConfig(BaseModel):
@@ -49,6 +52,8 @@ class KeyEncryptionConfig(BaseModel):
 
 class RequestLimitsConfig(BaseModel):
     max_body_bytes: int = 1_048_576
+    # Stream-read bodies without Content-Length and reject once over max (always on).
+    stream_body_limit: bool = True
     allowed_paths: list[str] = Field(
         default_factory=lambda: [
             "scrape",
@@ -64,11 +69,21 @@ class RequestLimitsConfig(BaseModel):
     )
 
 
+class HttpClientConfig(BaseModel):
+    """Upstream HTTP client behaviour. Pooling is OFF by default (legacy-safe)."""
+
+    connection_pool_enabled: bool = False
+    max_connections: int = 100
+    max_keepalive_connections: int = 20
+    keepalive_expiry_seconds: float = 30.0
+
+
 class SecurityConfig(BaseModel):
     client_auth: ClientAuthConfig = Field(default_factory=ClientAuthConfig)
     admin: AdminSecurityConfig = Field(default_factory=AdminSecurityConfig)
     key_encryption: KeyEncryptionConfig = Field(default_factory=KeyEncryptionConfig)
     request_limits: RequestLimitsConfig = Field(default_factory=RequestLimitsConfig)
+    http_client: HttpClientConfig = Field(default_factory=HttpClientConfig)
 
 
 class QuotaConfig(BaseModel):

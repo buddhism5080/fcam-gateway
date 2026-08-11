@@ -22,7 +22,9 @@ from app.core.credit_refresh_scheduler import (
     stop_credit_refresh_scheduler,
 )
 from app.core.forwarder import Forwarder
+from app.core.http_pool import UpstreamHttpPool
 from app.core.key_pool import KeyPool
+from app.core.runtime_settings import RuntimeSettings
 from app.core.rate_limit import RedisTokenBucketRateLimiter, TokenBucketRateLimiter
 from app.db.session import create_engine_from_config, create_session_factory
 from app.errors import register_exception_handlers
@@ -52,6 +54,13 @@ def create_app(*, config: AppConfig | None = None, secrets: Secrets | None = Non
                     db_engine.dispose()
             except Exception:
                 logger.exception("app.shutdown_db_dispose_failed")
+
+            http_pool = getattr(app.state, "http_pool", None)
+            if http_pool is not None:
+                try:
+                    http_pool.close()
+                except Exception:
+                    logger.exception("app.shutdown_http_pool_close_failed")
 
             redis_client = getattr(app.state, "redis", None)
             if redis_client is not None:
@@ -117,7 +126,20 @@ def create_app(*, config: AppConfig | None = None, secrets: Secrets | None = Non
         app.state.key_rate_limiter = TokenBucketRateLimiter()
         app.state.cooldown_store = NoopCooldownStore()
 
-    app.state.key_pool = KeyPool(cooldown_store=app.state.cooldown_store)
+    app.state.key_pool = KeyPool(
+        cooldown_store=app.state.cooldown_store,
+        runtime_settings=None,  # set below after runtime_settings init
+    )
+    app.state.runtime_settings = RuntimeSettings(scheduling=config.scheduling)
+    app.state.key_pool._runtime_settings = app.state.runtime_settings  # noqa: SLF001 — wire after both exist
+    http_cfg = config.security.http_client
+    app.state.http_pool = UpstreamHttpPool(
+        enabled=bool(http_cfg.connection_pool_enabled),
+        max_connections=int(http_cfg.max_connections),
+        max_keepalive_connections=int(http_cfg.max_keepalive_connections),
+        keepalive_expiry=float(http_cfg.keepalive_expiry_seconds),
+        transport=None,
+    )
 
     if config.observability.metrics_enabled:
         app.state.metrics = Metrics()
@@ -138,6 +160,8 @@ def create_app(*, config: AppConfig | None = None, secrets: Secrets | None = Non
         metrics=app.state.metrics,
         cooldown_store=app.state.cooldown_store,
         transport=None,
+        http_pool=app.state.http_pool,
+        runtime_settings=app.state.runtime_settings,
     )
 
     exa_allowed = set(config.providers.exa.allowed_paths) if config.providers.exa.enabled else set()
@@ -146,6 +170,7 @@ def create_app(*, config: AppConfig | None = None, secrets: Secrets | None = Non
         max_body_bytes=config.security.request_limits.max_body_bytes,
         allowed_api_paths=set(config.security.request_limits.allowed_paths),
         allowed_exa_paths=exa_allowed,
+        stream_body_limit=bool(getattr(config.security.request_limits, "stream_body_limit", True)),
     )
     app.add_middleware(FcamErrorMiddleware)
     app.add_middleware(RequestIdMiddleware)

@@ -24,6 +24,7 @@ import {
   fetchKeys,
   importKeysText,
   purgeKey,
+  reviveKey,
   testKey,
   updateKey,
   type KeyItem,
@@ -93,7 +94,19 @@ onMounted(async () => {
   await load();
 });
 
+async function onRevive(row: KeyItem) {
+  try {
+    const res = await reviveKey(row.id, { test: true, requeue_refresh: true });
+    const ok = res.test && typeof res.test === "object" && "ok" in (res.test as object) ? (res.test as { ok: boolean }).ok : true;
+    message.success(ok ? `已复活 Key #${row.id}` : `已复活但测活失败 Key #${row.id}`);
+    await load();
+  } catch (err) {
+    message.error(getFcamErrorMessage(err));
+  }
+}
+
 async function onCreate() {
+
   try {
     await createKey({
       api_key: createForm.api_key.trim(),
@@ -215,6 +228,12 @@ const columns = computed(() => [
       h(NTag, { type: statusType(row.status), size: "small" }, { default: () => row.status }),
   },
   {
+    title: "调度分",
+    key: "selection_score",
+    width: 90,
+    render: (r: KeyItem) => (r.selection_score == null ? "-" : Number(r.selection_score).toFixed(2)),
+  },
+  {
     title: "剩余额度",
     key: "cached_remaining_credits",
     width: 120,
@@ -250,14 +269,24 @@ const columns = computed(() => [
         { size: 4 },
         {
           default: () => [
-            h(NButton, { size: "tiny", onClick: () => onTest(row) }, { default: () => "测试" }),
-            h(
-              NButton,
-              { size: "tiny", secondary: true, onClick: () => onToggle(row) },
-              { default: () => (row.is_active ? "禁用" : "启用") }
-            ),
-            h(NButton, { size: "tiny", type: "error", quaternary: true, onClick: () => onPurge(row) }, { default: () => "删除" }),
-          ],
+                      h(NButton, { size: "tiny", onClick: () => onTest(row) }, { default: () => "测试" }),
+                      h(
+                        NButton,
+                        {
+                          size: "tiny",
+                          type: "warning",
+                          secondary: true,
+                          onClick: () => onRevive(row),
+                        },
+                        { default: () => "复活" },
+                      ),
+                      h(
+                        NButton,
+                        { size: "tiny", secondary: true, onClick: () => onToggle(row) },
+                        { default: () => (row.is_active ? "禁用" : "启用") },
+                      ),
+                      h(NButton, { size: "tiny", type: "error", quaternary: true, onClick: () => onPurge(row) }, { default: () => "删除" }),
+                    ],
         }
       ),
   },

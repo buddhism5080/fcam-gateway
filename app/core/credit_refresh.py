@@ -72,6 +72,7 @@ async def credit_refresh_loop(
     master_key: bytes,
     config: AppConfig,
     stop_event: asyncio.Event,
+    runtime_settings: object | None = None,
 ) -> None:
     """
     后台额度刷新循环：查找到期 Key -> 并发 workers 调用上游 -> 更新缓存与 next_refresh_at。
@@ -84,7 +85,12 @@ async def credit_refresh_loop(
 
     while not stop_event.is_set():
         try:
-            await _refresh_once(db_factory=db_factory, master_key=master_key, config=config)
+            await _refresh_once(
+                db_factory=db_factory,
+                master_key=master_key,
+                config=config,
+                runtime_settings=runtime_settings,
+            )
         except Exception:
             logger.exception("credit.refresh_loop_failed")
 
@@ -165,7 +171,13 @@ async def _refresh_one_key(
             db.close()
 
 
-async def _refresh_once(*, db_factory: Callable[[], Session], master_key: bytes, config: AppConfig) -> None:
+async def _refresh_once(
+    *,
+    db_factory: Callable[[], Session],
+    master_key: bytes,
+    config: AppConfig,
+    runtime_settings: object | None = None,
+) -> None:
     db = db_factory()
     try:
         now = datetime.now(timezone.utc)
@@ -186,6 +198,11 @@ async def _refresh_once(*, db_factory: Callable[[], Session], master_key: bytes,
             return
 
         workers = max(int(getattr(config.credit_monitoring, "workers", 4) or 4), 1)
+        if runtime_settings is not None and hasattr(runtime_settings, "effective_credit_workers"):
+            try:
+                workers = max(int(runtime_settings.effective_credit_workers(workers)), 1)
+            except Exception:
+                pass
         # SQLite does not love multi-writer contention — serialize refresh under sqlite.
         try:
             bind = db.get_bind()
