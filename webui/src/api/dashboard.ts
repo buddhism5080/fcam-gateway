@@ -67,19 +67,25 @@ export async function fetchClientUsage(hours = 24) {
   return res.data;
 }
 
+export type RuntimeKnobs = {
+  freshness_half_life_seconds: number;
+  unknown_credit_baseline: number;
+  credit_workers: number;
+  http_connection_pool_enabled?: boolean;
+  credit_batch_size?: number;
+  credit_batch_delay_seconds?: number;
+  credit_refresh_check_interval_seconds?: number;
+  credit_retry_delay_minutes?: number;
+  epsilon_greedy?: number;
+};
+
 export type RuntimeScheduling = {
-  file: {
-    freshness_half_life_seconds: number;
-    unknown_credit_baseline: number;
-    credit_workers: number;
-  };
-  effective: {
-    freshness_half_life_seconds: number;
-    unknown_credit_baseline: number;
-    credit_workers: number;
-  };
-  overrides: Record<string, number | null | undefined>;
+  file: RuntimeKnobs;
+  effective: RuntimeKnobs;
+  overrides: Record<string, number | boolean | null | undefined>;
   http_connection_pool_enabled: boolean;
+  persisted?: boolean;
+  persist_path?: string | null;
 };
 
 export async function fetchRuntimeScheduling() {
@@ -87,12 +93,26 @@ export async function fetchRuntimeScheduling() {
   return res.data;
 }
 
-export async function updateRuntimeScheduling(payload: {
+export type RuntimeSchedulingUpdate = {
   freshness_half_life_seconds?: number | null;
   unknown_credit_baseline?: number | null;
   credit_workers?: number | null;
   clear_credit_workers_override?: boolean;
-}) {
+  http_connection_pool_enabled?: boolean | null;
+  clear_http_connection_pool_override?: boolean;
+  credit_batch_size?: number | null;
+  clear_credit_batch_size?: boolean;
+  credit_batch_delay_seconds?: number | null;
+  clear_credit_batch_delay_seconds?: boolean;
+  credit_refresh_check_interval_seconds?: number | null;
+  clear_credit_refresh_check_interval_seconds?: boolean;
+  credit_retry_delay_minutes?: number | null;
+  clear_credit_retry_delay_minutes?: boolean;
+  epsilon_greedy?: number | null;
+  clear_epsilon_greedy?: boolean;
+};
+
+export async function updateRuntimeScheduling(payload: RuntimeSchedulingUpdate) {
   const res = await http.put<RuntimeScheduling>("/admin/runtime/scheduling", payload);
   return res.data;
 }

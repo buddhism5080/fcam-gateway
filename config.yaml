@@ -52,26 +52,36 @@ rate_limit:
   cooldown_seconds: 60
 
 scheduling:
-  # Scientific key selection: score = log1p(remaining) * 1/(1 + age/half_life)
+  # score = log1p(remaining_or_baseline_credits) * freshness * failure_weight
   freshness_half_life_seconds: 21600  # 6h
+  # Assumed remaining credits when unknown; weight = log1p(value), e.g. 50 → log1p(50)
   unknown_credit_baseline: 50.0
+  epsilon_greedy: 0.1
+  near_score_ratio: 0.95
+  failure_penalty_half_life_seconds: 300
+  failure_penalty_unit: 1.0
 
 credit_monitoring:
   enabled: true
 
   smart_refresh:
     enabled: true
-    high_usage_interval: 15
-    medium_usage_interval: 30
-    normal_usage_interval: 60
-    low_usage_interval: 120
+    # usage high → refresh more often (minutes)
+    high_usage_interval: 30
+    medium_usage_interval: 60
+    normal_usage_interval: 120
+    low_usage_interval: 240
+    # remaining >= threshold → interval floored to at least abundant_min_interval_minutes
+    abundant_remaining_threshold: 1000
+    abundant_min_interval_minutes: 120
 
   fixed_refresh:
     interval_minutes: 60
 
   batch_size: 10
   batch_delay_seconds: 5
-  # Concurrent refresh workers (thread-like parallelism via asyncio)
+  # Concurrent refresh workers for upstream HTTP probes.
+  # Results are buffered in memory then written to DB serially (SQLite-safe multi-worker).
   workers: 4
 
   local_estimation:

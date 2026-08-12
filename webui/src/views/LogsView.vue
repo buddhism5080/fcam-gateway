@@ -5,6 +5,8 @@ import { computed, h, onMounted, reactive, ref, watch } from "vue";
 import { fetchRequestLogs, type RequestLogItem } from "@/api/logs";
 import { getFcamErrorMessage } from "@/api/http";
 import { adminToken } from "@/state/adminAuth";
+import { displayTimezone } from "@/state/timezone";
+import { copyTextToClipboard } from "@/utils/clipboard";
 import { formatTimestamp } from "@/utils/time";
 
 const message = useMessage();
@@ -160,12 +162,9 @@ function formatJsonMaybe(value: string | null): string {
 }
 
 async function copyText(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    message.success("已复制");
-  } catch {
-    message.warning("复制失败（请手动复制）");
-  }
+  const ok = await copyTextToClipboard(text);
+  if (ok) message.success("已复制");
+  else message.warning("复制失败（请手动选中后 Ctrl+C）");
 }
 
 const showDetail = ref(false);
@@ -203,13 +202,13 @@ const columnLabels: Record<string, string> = {
   level: "级别",
   endpoint: "端点",
   status_code: "状态码",
-  success: "成功",
-  client_id: "Client ID",
-  api_key_masked: "API Key",
+  success: "结果",
+  client_id: "客户端 ID",
+  api_key_masked: "上游密钥",
   retry_count: "重试次数",
   error_message: "错误信息",
   detail: "详情",
-  request_id: "Request ID",
+  request_id: "请求 ID",
 };
 
 // 从 localStorage 加载可见列配置
@@ -238,38 +237,40 @@ watch(visibleColumns, (cols) => {
   }
 }, { deep: true });
 
-const columns = [
+const columns = computed(() => {
+  void displayTimezone.value;
+  return [
   {
     title: "时间",
     key: "created_at",
     width: 170,
     render: (row: RequestLogItem) => formatTimestamp(row.created_at)
   },
-  { title: "level", key: "level", width: 90, render: (row: RequestLogItem) => levelTag(row) },
-  { title: "endpoint", key: "endpoint", width: 110 },
-  { title: "status", key: "status_code", width: 80 },
+  { title: "级别", key: "level", width: 90, render: (row: RequestLogItem) => levelTag(row) },
+  { title: "端点", key: "endpoint", width: 110 },
+  { title: "状态码", key: "status_code", width: 80 },
   {
-    title: "ok",
+    title: "结果",
     key: "success",
     width: 70,
     render: (row: RequestLogItem) => {
       const ok = row.success;
-      const text = ok === true ? "OK" : ok === false ? "ERR" : "-";
+      const text = ok === true ? "成功" : ok === false ? "失败" : "-";
       const color =
         ok === true ? "var(--success-color)" : ok === false ? "var(--error-color)" : "var(--text-tertiary)";
       return h("span", { style: `color:${color}` }, text);
     },
   },
-  { title: "client_id", key: "client_id", width: 90 },
+  { title: "客户端 ID", key: "client_id", width: 100 },
   {
-    title: "key",
+    title: "上游密钥",
     key: "api_key_masked",
     width: 120,
     render: (row: RequestLogItem) =>
       row.api_key_masked ? h("span", { class: "mono" }, row.api_key_masked) : "-",
   },
-  { title: "retry", key: "retry_count", width: 70 },
-  { title: "error_code", key: "error_message" },
+  { title: "重试", key: "retry_count", width: 70 },
+  { title: "错误信息", key: "error_message" },
   {
     title: "详情",
     key: "detail",
@@ -282,16 +283,17 @@ const columns = [
       ),
   },
   {
-    title: "request_id",
+    title: "请求 ID",
     key: "request_id",
     width: 220,
     render: (row: RequestLogItem) => h("span", { class: "mono" }, row.request_id),
   },
 ];
+});
 
 // 根据用户选择过滤列
 const filteredColumns = computed(() => {
-  return columns.filter(col => visibleColumns.value.includes(col.key));
+  return columns.value.filter(col => visibleColumns.value.includes(col.key));
 });
 
 // 列选择选项
@@ -327,13 +329,13 @@ const columnOptions = computed(() => {
       <n-space wrap>
         <n-select v-model:value="pageSize" size="small" :options="pageSizeOptions" style="width: 120px" />
         <n-select v-model:value="filters.level" size="small" :options="levelOptions" style="width: 130px" />
-        <n-input v-model:value="filters.client_id" size="small" placeholder="client_id" style="width: 120px" />
+        <n-input v-model:value="filters.client_id" size="small" placeholder="客户端 ID" style="width: 120px" />
         <n-select v-model:value="filters.endpoint" size="small" :options="endpointOptions" style="width: 160px" />
         <n-select v-model:value="filters.success" size="small" :options="successOptions" style="width: 120px" />
         <n-input
           v-model:value="filters.q"
           size="small"
-          placeholder="搜索 request_id / endpoint / error..."
+          placeholder="搜索 请求ID / 端点 / 错误..."
           style="width: 360px"
         />
       </n-space>

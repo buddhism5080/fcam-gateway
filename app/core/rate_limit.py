@@ -21,6 +21,27 @@ class TokenBucketRateLimiter:
         self._lock = threading.Lock()
         self._buckets: dict[str, _Bucket] = {}
 
+    def peek(self, key: str, rate_per_min: int) -> tuple[bool, int]:
+        """Read-only check: would allow() succeed without consuming a token."""
+        if rate_per_min <= 0:
+            return True, 0
+
+        capacity = float(rate_per_min)
+        refill_per_sec = capacity / 60.0
+        now = time.monotonic()
+
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                return True, 0
+            elapsed = max(now - bucket.last_refill, 0.0)
+            tokens = min(capacity, bucket.tokens + elapsed * refill_per_sec)
+            if tokens >= 1.0:
+                return True, 0
+            needed = 1.0 - tokens
+            retry_after = int(math.ceil(needed / refill_per_sec))
+            return False, max(retry_after, 1)
+
     def allow(self, key: str, rate_per_min: int) -> tuple[bool, int]:
         if rate_per_min <= 0:
             return True, 0

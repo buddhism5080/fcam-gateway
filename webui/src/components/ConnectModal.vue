@@ -65,10 +65,10 @@ async function onConnect() {
 
 <template>
   <n-modal :show="show" preset="card" style="max-width: 520px" @update:show="(v) => emit('update:show', v)">
-      <n-card title="连接 Admin Token" :bordered="false">
+      <n-card title="连接管理令牌" :bordered="false">
       <n-space vertical>
         <div class="muted" style="font-size: 13px">
-          该 Token 仅用于调用 <span class="mono">/admin/*</span> 控制面接口。
+          该令牌仅用于调用 <span class="mono">/admin/*</span> 控制面接口。
         </div>
 
         <n-input

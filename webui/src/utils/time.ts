@@ -1,25 +1,51 @@
 /**
- * 格式化时间戳为易读格式
- * @param timestamp ISO 8601 格式的时间戳（如 "2026-02-25T07:38:33.656012Z"）
- * @returns 格式化后的时间字符串（如 "2026-02-25 07:38:33"）
+ * Time formatting helpers. Absolute timestamps respect the UI timezone preference
+ * (localStorage; default = browser timezone). Relative times are timezone-independent.
+ */
+import { displayTimezone } from "@/state/timezone";
+
+function activeTz(): string {
+  return displayTimezone.value || "UTC";
+}
+
+function partsInZone(date: Date, timeZone: string): Record<string, string> {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    hourCycle: "h23",
+  });
+  const out: Record<string, string> = {};
+  for (const p of fmt.formatToParts(date)) {
+    if (p.type !== "literal") out[p.type] = p.value;
+  }
+  // Some engines emit hour "24" for midnight — normalize.
+  if (out.hour === "24") out.hour = "00";
+  return out;
+}
+
+/**
+ * Format ISO timestamp as YYYY-MM-DD HH:mm:ss in the selected display timezone.
  */
 export function formatTimestamp(timestamp: string | null | undefined): string {
   if (!timestamp) return "-";
 
   try {
     const date = new Date(timestamp);
-
-    // 检查日期是否有效
     if (isNaN(date.getTime())) return timestamp;
 
-    // 格式化为 YYYY-MM-DD HH:mm:ss
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    const hours = String(date.getHours()).padStart(2, "0");
-    const minutes = String(date.getMinutes()).padStart(2, "0");
-    const seconds = String(date.getSeconds()).padStart(2, "0");
-
+    const p = partsInZone(date, activeTz());
+    const year = p.year ?? "????";
+    const month = p.month ?? "??";
+    const day = p.day ?? "??";
+    const hours = p.hour ?? "??";
+    const minutes = p.minute ?? "??";
+    const seconds = p.second ?? "??";
     return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
   } catch {
     return timestamp;
@@ -27,7 +53,7 @@ export function formatTimestamp(timestamp: string | null | undefined): string {
 }
 
 /**
- * 格式化时间戳为相对时间（如 "5 分钟前" / "55 分钟后"）。
+ * Relative time (e.g. "5 分钟前" / "55 分钟后"). Independent of display timezone.
  */
 export function formatRelativeTime(timestamp: string | null | undefined): string {
   if (!timestamp) return "-";
@@ -63,11 +89,21 @@ export function formatDate(timestamp: string | null | undefined): string {
   try {
     const date = new Date(timestamp);
     if (isNaN(date.getTime())) return timestamp;
+    const p = partsInZone(date, activeTz());
+    return `${p.year ?? "????"}-${p.month ?? "??"}-${p.day ?? "??"}`;
+  } catch {
+    return timestamp;
+  }
+}
 
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    return `${year}-${month}-${day}`;
+/** HH:mm in display timezone (charts). */
+export function formatClockTime(timestamp: string | null | undefined): string {
+  if (!timestamp) return "-";
+  try {
+    const date = new Date(timestamp);
+    if (isNaN(date.getTime())) return timestamp;
+    const p = partsInZone(date, activeTz());
+    return `${p.hour ?? "??"}:${p.minute ?? "??"}`;
   } catch {
     return timestamp;
   }

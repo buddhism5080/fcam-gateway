@@ -20,13 +20,16 @@ import {
   batchUpdateClients,
   createClient,
   fetchClients,
+  revealClientToken,
   rotateClientToken,
   updateClient,
   type ClientItem,
 } from "@/api/clients";
 import { getFcamErrorMessage } from "@/api/http";
 import { adminToken, verifyAdminToken } from "@/state/adminAuth";
+import { copyFromInputElement, copyTextToClipboard, selectInputElement } from "@/utils/clipboard";
 import { formatRelativeTime } from "@/utils/time";
+import { nextTick } from "vue";
 
 const message = useMessage();
 const dialog = useDialog();
@@ -37,19 +40,60 @@ const search = ref("");
 const checked = ref<number[]>([]);
 
 const showCreate = ref(false);
-const tokenModal = ref<{ name: string; token: string } | null>(null);
+const tokenModal = ref<{ name: string; token: string; mode: "create" | "rotate" | "reveal" } | null>(null);
+/** Native textarea so we can select + copy reliably (NInput wraps and breaks selection). */
+const tokenTextareaRef = ref<HTMLTextAreaElement | null>(null);
 const createForm = reactive({
   name: "",
   rate_limit_per_min: 60,
   max_concurrent: 10,
   max_retries: 3,
+  token: "",
 });
+
+async function focusSelectTokenField() {
+  await nextTick();
+  selectInputElement(tokenTextareaRef.value);
+}
+
+async function openTokenModal(payload: { name: string; token: string; mode: "create" | "rotate" | "reveal" }) {
+  tokenModal.value = payload;
+  await focusSelectTokenField();
+}
 
 const filtered = computed(() => {
   const q = search.value.trim().toLowerCase();
   if (!q) return clients.value;
   return clients.value.filter((c) => `${c.id} ${c.name}`.toLowerCase().includes(q));
 });
+
+function generateClientTokenLocal(): string {
+  // Match server style: fcam_client_ + url-safe random
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let s = "";
+  for (const b of bytes) s += alphabet[b % alphabet.length];
+  return `fcam_client_${s}`;
+}
+
+function validateTokenComplexity(token: string): string | null {
+  const t = token.trim();
+  if (t.length < 24) return "令牌长度至少 24 个字符";
+  if (t.length > 256) return "令牌长度不能超过 256 个字符";
+  let classes = 0;
+  if (/[a-z]/.test(t)) classes++;
+  if (/[A-Z]/.test(t)) classes++;
+  if (/[0-9]/.test(t)) classes++;
+  if (/[^a-zA-Z0-9]/.test(t)) classes++;
+  if (classes < 3) return "令牌需至少包含三类字符（大写/小写/数字/特殊符号）";
+  return null;
+}
+
+function onRandomToken() {
+  createForm.token = generateClientTokenLocal();
+  message.success("已生成随机令牌（也可手动修改）");
+}
 
 async function load() {
   if (!adminToken.value) return;
@@ -69,16 +113,31 @@ onMounted(async () => {
 });
 
 async function onCreate() {
+  const name = createForm.name.trim();
+  if (!name) {
+    message.warning("请填写名称");
+    return;
+  }
+  const manual = createForm.token.trim();
+  if (manual) {
+    const err = validateTokenComplexity(manual);
+    if (err) {
+      message.error(err);
+      return;
+    }
+  }
   try {
     const res = await createClient({
-      name: createForm.name.trim(),
+      name,
       rate_limit_per_min: createForm.rate_limit_per_min,
       max_concurrent: createForm.max_concurrent,
       max_retries: createForm.max_retries,
+      token: manual || null,
     });
-    tokenModal.value = { name: res.client.name, token: res.token };
+    await openTokenModal({ name: res.client.name, token: res.token, mode: "create" });
     showCreate.value = false;
     createForm.name = "";
+    createForm.token = "";
     await load();
   } catch (err) {
     message.error(getFcamErrorMessage(err));
@@ -87,20 +146,29 @@ async function onCreate() {
 
 async function onRotate(row: ClientItem) {
   dialog.warning({
-    title: "轮换 Client Token",
-    content: `轮换后旧 token 立即失效。确认轮换「${row.name}」？`,
+    title: "轮换客户端令牌",
+    content: `轮换后旧令牌立即失效。确认轮换「${row.name}」？`,
     positiveText: "轮换",
     negativeText: "取消",
     onPositiveClick: async () => {
       try {
         const res = await rotateClientToken(row.id);
-        tokenModal.value = { name: row.name, token: res.token };
+        await openTokenModal({ name: row.name, token: res.token, mode: "rotate" });
         await load();
       } catch (err) {
         message.error(getFcamErrorMessage(err));
       }
     },
   });
+}
+
+async function onReveal(row: ClientItem) {
+  try {
+    const res = await revealClientToken(row.id);
+    await openTokenModal({ name: res.name || row.name, token: res.token, mode: "reveal" });
+  } catch (err) {
+    message.error(getFcamErrorMessage(err));
+  }
 }
 
 async function onToggle(row: ClientItem) {
@@ -141,11 +209,17 @@ async function onBatch(action: "enable" | "disable" | "delete") {
 
 async function copyToken() {
   if (!tokenModal.value) return;
-  try {
-    await navigator.clipboard.writeText(tokenModal.value.token);
-    message.success("已复制");
-  } catch {
-    message.error("复制失败，请手动选择");
+  // Prefer the visible textarea — most reliable under plain HTTP / Discord-embedded browsers.
+  let ok = await copyFromInputElement(tokenTextareaRef.value);
+  if (!ok) {
+    ok = await copyTextToClipboard(tokenModal.value.token);
+  }
+  // Always re-select so user can Ctrl+C / Cmd+C if OS clipboard still empty
+  selectInputElement(tokenTextareaRef.value);
+  if (ok) {
+    message.success("已复制（若粘贴为空，文本已全选，请再按 Ctrl+C）");
+  } else {
+    message.warning("自动复制受限：令牌已全选，请按 Ctrl+C（Mac: ⌘C）");
   }
 }
 
@@ -169,7 +243,7 @@ const columns = computed(() => [
       h(
         NTag,
         { type: row.is_active ? "success" : "error", size: "small" },
-        { default: () => (row.is_active ? "active" : "disabled") }
+        { default: () => (row.is_active ? "启用" : "禁用") }
       ),
   },
   {
@@ -203,7 +277,7 @@ const columns = computed(() => [
       }),
   },
   {
-    title: "换 Key 重试",
+    title: "换密钥重试",
     key: "max_retries",
     width: 130,
     render: (row: ClientItem) =>
@@ -221,14 +295,15 @@ const columns = computed(() => [
   {
     title: "操作",
     key: "actions",
-    width: 200,
+    width: 280,
     render: (row: ClientItem) =>
       h(
         NSpace,
         { size: 4 },
         {
           default: () => [
-            h(NButton, { size: "tiny", onClick: () => onRotate(row) }, { default: () => "轮换 Token" }),
+            h(NButton, { size: "tiny", type: "primary", secondary: true, onClick: () => onReveal(row) }, { default: () => "显示令牌" }),
+            h(NButton, { size: "tiny", onClick: () => onRotate(row) }, { default: () => "轮换令牌" }),
             h(
               NButton,
               { size: "tiny", secondary: true, onClick: () => onToggle(row) },
@@ -245,20 +320,21 @@ const columns = computed(() => [
   <div class="page">
     <div class="page-head">
       <div>
-        <h2>下游 Clients</h2>
-        <p class="sub">下游密钥：可配置 RPM、并发、换 Key 重试次数。请求走统一上游池。</p>
+        <h2>下游客户端</h2>
+        <p class="sub">下游令牌：可配置 RPM、并发、换密钥重试次数。请求走统一上游池。</p>
       </div>
-      <NButton type="primary" @click="showCreate = true">创建 Client</NButton>
+      <NButton type="primary" @click="showCreate = true">创建客户端</NButton>
     </div>
 
     <NAlert type="info" :bordered="false" style="margin-bottom: 16px">
-      每个 Client 独立设置 <b>RPM</b> 与 <b>并发</b>。当上游 Key 出现额度问题 / 429 / 失效时，
-      按该 Client 的 <b>max_retries</b> 自动切换上游 Key，而不是直接把错误返回给调用方。
+      每个客户端独立设置 <b>RPM</b> 与 <b>并发</b>。当上游密钥出现额度问题 / 429 / 失效时，
+      按该客户端的 <b>换密钥重试次数</b> 自动切换上游密钥，而不是直接把错误返回给调用方。
+      新创建/轮换的令牌会加密存库，可再次「显示令牌」并复制。
     </NAlert>
 
     <NCard :bordered="false" class="panel">
       <NSpace style="margin-bottom: 12px">
-        <NInput v-model:value="search" clearable placeholder="搜索 Client" style="width: 220px" />
+        <NInput v-model:value="search" clearable placeholder="搜索客户端" style="width: 220px" />
         <NButton :disabled="!checked.length" @click="onBatch('enable')">批量启用</NButton>
         <NButton :disabled="!checked.length" @click="onBatch('disable')">批量禁用</NButton>
         <NButton :disabled="!checked.length" type="error" secondary @click="onBatch('delete')">批量删除</NButton>
@@ -273,10 +349,24 @@ const columns = computed(() => [
       />
     </NCard>
 
-    <NModal v-model:show="showCreate" preset="card" title="创建下游 Client" style="width: 480px">
+    <NModal v-model:show="showCreate" preset="card" title="创建下游客户端" style="width: 520px">
       <NForm label-placement="left" label-width="120">
         <NFormItem label="名称" required>
           <NInput v-model:value="createForm.name" placeholder="例如 my-bot" />
+        </NFormItem>
+        <NFormItem label="下游令牌">
+          <NSpace vertical style="width: 100%">
+            <NInput
+              v-model:value="createForm.token"
+              type="textarea"
+              :rows="2"
+              placeholder="留空则服务端随机生成；也可手动填入（≥24 字符，含大小写/数字/符号中至少三类）"
+            />
+            <NSpace>
+              <NButton size="small" @click="onRandomToken">随机生成</NButton>
+              <span class="hint">手动填写时需满足复杂度；随机生成的可直接用</span>
+            </NSpace>
+          </NSpace>
         </NFormItem>
         <NFormItem label="RPM">
           <NInputNumber v-model:value="createForm.rate_limit_per_min" :min="0" />
@@ -284,7 +374,7 @@ const columns = computed(() => [
         <NFormItem label="并发">
           <NInputNumber v-model:value="createForm.max_concurrent" :min="0" />
         </NFormItem>
-        <NFormItem label="换 Key 重试">
+        <NFormItem label="换密钥重试">
           <NInputNumber v-model:value="createForm.max_retries" :min="0" :max="50" />
         </NFormItem>
       </NForm>
@@ -296,16 +386,36 @@ const columns = computed(() => [
       </template>
     </NModal>
 
-    <NModal :show="!!tokenModal" preset="card" title="Client Token（仅显示一次）" style="width: 520px" @update:show="(v:boolean) => !v && (tokenModal = null)">
-      <NAlert type="warning" :bordered="false" style="margin-bottom: 12px">
-        请立即复制保存。关闭后无法再次查看明文 token，只能轮换。
+    <NModal
+      :show="!!tokenModal"
+      preset="card"
+      :title="tokenModal?.mode === 'reveal' ? '客户端令牌' : '客户端令牌（请妥善保存）'"
+      style="width: 520px"
+      @update:show="(v: boolean) => !v && (tokenModal = null)"
+    >
+      <NAlert v-if="tokenModal?.mode !== 'reveal'" type="warning" :bordered="false" style="margin-bottom: 12px">
+        请复制保存。新创建/轮换后的令牌已加密入库，之后仍可点「显示令牌」再次查看。
+      </NAlert>
+      <NAlert v-else type="info" :bordered="false" style="margin-bottom: 12px">
+        以下为解密后的明文令牌，可直接复制使用。
       </NAlert>
       <div v-if="tokenModal">
-        <div style="margin-bottom: 8px; color: #64748b">Client：{{ tokenModal.name }}</div>
-        <NInput :value="tokenModal.token" type="textarea" :rows="3" readonly />
+        <div style="margin-bottom: 8px; color: #64748b">客户端：{{ tokenModal.name }}</div>
+        <textarea
+          ref="tokenTextareaRef"
+          class="token-ta"
+          :value="tokenModal.token"
+          readonly
+          rows="3"
+          @focus="selectInputElement(($event.target as HTMLTextAreaElement))"
+        />
+        <div class="hint" style="margin-top: 8px">
+          若按钮复制无效：点输入框会全选，再按 <b>Ctrl+C</b>（Mac: <b>⌘C</b>）。
+        </div>
       </div>
       <template #footer>
         <NSpace justify="end">
+          <NButton @click="focusSelectTokenField">全选</NButton>
           <NButton type="primary" @click="copyToken">复制</NButton>
           <NButton @click="tokenModal = null">关闭</NButton>
         </NSpace>
@@ -338,5 +448,27 @@ const columns = computed(() => [
 .panel {
   background: rgba(255, 255, 255, 0.92);
   border-radius: 16px;
+}
+.hint {
+  font-size: 12px;
+  color: #94a3b8;
+}
+.token-ta {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  padding: 10px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #0f172a;
+  resize: vertical;
+  outline: none;
+}
+.token-ta:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
 }
 </style>

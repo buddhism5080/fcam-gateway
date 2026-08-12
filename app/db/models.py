@@ -89,6 +89,8 @@ class Client(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # AES-GCM blob so admin can re-display token; null for legacy rows created before this field.
+    token_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # Optional client daily quota (off by default). Primary controls: RPM + concurrency + retries.

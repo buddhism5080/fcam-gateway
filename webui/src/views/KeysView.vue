@@ -15,7 +15,7 @@ import {
   useDialog,
   useMessage,
 } from "naive-ui";
-import { computed, h, onMounted, reactive, ref } from "vue";
+import { computed, h, onMounted, reactive, ref, watch } from "vue";
 
 import { getFcamErrorMessage } from "@/api/http";
 import {
@@ -31,6 +31,7 @@ import {
 } from "@/api/keys";
 import { refreshAllCredits } from "@/api/credits";
 import { adminToken, verifyAdminToken } from "@/state/adminAuth";
+import { displayTimezone } from "@/state/timezone";
 import { formatRelativeTime, formatTimestamp } from "@/utils/time";
 
 const message = useMessage();
@@ -41,8 +42,11 @@ const keys = ref<KeyItem[]>([]);
 const page = ref(1);
 const pageSize = ref(20);
 const total = ref(0);
+const sortBy = ref<string>("id");
+const sortOrder = ref<"asc" | "desc">("desc");
 const q = ref("");
 const provider = ref<string | null>(null);
+const statusFilter = ref<string | null>(null);
 const checked = ref<number[]>([]);
 
 const showCreate = ref(false);
@@ -62,12 +66,34 @@ const providerOptions = [
   { label: "Exa", value: "exa" },
 ];
 
+const statusFilterOptions = [
+  { label: "可用", value: "active" },
+  { label: "冷却中", value: "cooling" },
+  { label: "失败", value: "failed" },
+  { label: "已失效", value: "invalid" },
+  { label: "已禁用", value: "disabled" },
+  { label: "解密失败", value: "decrypt_failed" },
+];
+
 const statusType = (s: string) => {
   const v = (s || "").toLowerCase();
   if (v === "active") return "success" as const;
   if (v === "cooling" || v === "failed") return "warning" as const;
   if (v === "invalid" || v === "disabled" || v === "decrypt_failed") return "error" as const;
   return "default" as const;
+};
+
+const statusLabel = (s: string) => {
+  const v = (s || "").toLowerCase();
+  const map: Record<string, string> = {
+    active: "可用",
+    cooling: "冷却中",
+    failed: "失败",
+    invalid: "已失效",
+    disabled: "已禁用",
+    decrypt_failed: "解密失败",
+  };
+  return map[v] || s || "-";
 };
 
 async function load() {
@@ -79,9 +105,16 @@ async function load() {
       pageSize: pageSize.value,
       q: q.value.trim() || undefined,
       provider: provider.value || undefined,
+      status: statusFilter.value || undefined,
+      sortBy: sortBy.value,
+      sortOrder: sortOrder.value,
     });
     keys.value = res.items;
     total.value = res.pagination?.total_items ?? res.items.length;
+    // Keep local page in sync with server when out of range
+    if (res.pagination?.page && res.pagination.page !== page.value) {
+      page.value = res.pagination.page;
+    }
   } catch (err) {
     message.error(getFcamErrorMessage(err));
   } finally {
@@ -89,10 +122,58 @@ async function load() {
   }
 }
 
+/** Server-side pagination. Note: `remote` must be on NDataTable, NOT inside pagination. */
+const pagination = computed(() => ({
+  page: page.value,
+  pageSize: pageSize.value,
+  itemCount: total.value,
+  pageCount: Math.max(1, Math.ceil((total.value || 0) / (pageSize.value || 1))),
+  pageSizes: [20, 50, 100],
+  showSizePicker: true,
+  prefix: ({ itemCount }: { itemCount: number | undefined }) =>
+    `共 ${itemCount ?? total.value} 条 · 第 ${page.value} 页`,
+  onUpdatePage: (p: number) => {
+    page.value = p;
+    void load();
+  },
+  onUpdatePageSize: (ps: number) => {
+    pageSize.value = ps;
+    page.value = 1;
+    void load();
+  },
+}));
+
 onMounted(async () => {
   if (adminToken.value) await verifyAdminToken();
   await load();
 });
+
+watch(adminToken, async (token) => {
+  if (!token) {
+    keys.value = [];
+    total.value = 0;
+    return;
+  }
+  page.value = 1;
+  await load();
+});
+
+function onSearch() {
+  page.value = 1;
+  void load();
+}
+
+function onSort(sorter: { columnKey?: string | number; order?: "ascend" | "descend" | false } | null) {
+  if (!sorter || !sorter.order || !sorter.columnKey) {
+    sortBy.value = "id";
+    sortOrder.value = "desc";
+  } else {
+    sortBy.value = String(sorter.columnKey);
+    sortOrder.value = sorter.order === "ascend" ? "asc" : "desc";
+  }
+  page.value = 1;
+  void load();
+}
 
 async function onRevive(row: KeyItem) {
   try {
@@ -194,7 +275,7 @@ async function onBatchDisable() {
   if (!checked.value.length) return;
   try {
     await batchKeys({ ids: checked.value, patch: { is_active: false } });
-    message.success(`已禁用 ${checked.value.length} 个 Key`);
+    message.success(`已禁用 ${checked.value.length} 个密钥`);
     checked.value = [];
     await load();
   } catch (err) {
@@ -202,12 +283,42 @@ async function onBatchDisable() {
   }
 }
 
-const columns = computed(() => [
+function onBatchDelete() {
+  if (!checked.value.length) return;
+  const n = checked.value.length;
+  dialog.warning({
+    title: "批量删除密钥",
+    content: `将彻底删除选中的 ${n} 个上游密钥（不可恢复，等同 purge）。确认？`,
+    positiveText: "删除",
+    negativeText: "取消",
+    onPositiveClick: async () => {
+      try {
+        const res = await batchKeys({ ids: checked.value, purge: true });
+        message.success(`已删除 ${res.succeeded} 个 / 失败 ${res.failed}`);
+        checked.value = [];
+        await load();
+      } catch (err) {
+        message.error(getFcamErrorMessage(err));
+      }
+    },
+  });
+}
+
+const columns = computed(() => {
+  // depend on displayTimezone so absolute timestamps re-render when TZ changes
+  void displayTimezone.value;
+  const so = (key: string): "ascend" | "descend" | false => {
+    if (sortBy.value !== key) return false;
+    return sortOrder.value === "asc" ? "ascend" : "descend";
+  };
+  return [
   { type: "selection" as const },
-  { title: "ID", key: "id", width: 70 },
+  { title: "ID", key: "id", width: 70, sorter: "default" as const, sortOrder: so("id") },
   {
     title: "名称 / 掩码",
     key: "name",
+    sorter: "default" as const,
+    sortOrder: so("name"),
     render: (row: KeyItem) =>
       h("div", [
         h("div", { style: "font-weight:600" }, row.name || "—"),
@@ -215,28 +326,36 @@ const columns = computed(() => [
       ]),
   },
   {
-    title: "Provider",
+    title: "上游服务",
     key: "provider",
-    width: 100,
+    width: 110,
+    sorter: "default" as const,
+    sortOrder: so("provider"),
     render: (row: KeyItem) => h(NTag, { size: "small", bordered: false }, { default: () => row.provider }),
   },
   {
     title: "状态",
     key: "status",
     width: 110,
+    sorter: "default" as const,
+    sortOrder: so("status"),
     render: (row: KeyItem) =>
-      h(NTag, { type: statusType(row.status), size: "small" }, { default: () => row.status }),
+      h(NTag, { type: statusType(row.status), size: "small" }, { default: () => statusLabel(row.status) }),
   },
   {
     title: "调度分",
     key: "selection_score",
     width: 90,
+    sorter: "default" as const,
+    sortOrder: so("selection_score"),
     render: (r: KeyItem) => (r.selection_score == null ? "-" : Number(r.selection_score).toFixed(2)),
   },
   {
     title: "剩余额度",
     key: "cached_remaining_credits",
     width: 120,
+    sorter: "default" as const,
+    sortOrder: so("cached_remaining_credits"),
     render: (row: KeyItem) => {
       const r = row.cached_remaining_credits;
       const p = row.cached_plan_credits;
@@ -248,6 +367,8 @@ const columns = computed(() => [
     title: "额度刷新",
     key: "last_credit_check_at",
     width: 140,
+    sorter: "default" as const,
+    sortOrder: so("last_credit_check_at"),
     render: (row: KeyItem) =>
       h("div", { style: "font-size:12px;color:#64748b" }, [
         h("div", formatRelativeTime(row.last_credit_check_at) || "从未"),
@@ -258,6 +379,8 @@ const columns = computed(() => [
     title: "请求数",
     key: "total_requests",
     width: 90,
+    sorter: "default" as const,
+    sortOrder: so("total_requests"),
   },
   {
     title: "操作",
@@ -290,34 +413,37 @@ const columns = computed(() => [
         }
       ),
   },
-]);
+  ];
+});
 </script>
 
 <template>
   <div class="page">
     <div class="page-head">
       <div>
-        <h2>上游 Key 池</h2>
+        <h2>上游密钥池</h2>
         <p class="sub">统一全局池 · 科学调度（额度充足 + 刷新新鲜优先）· 额度为 0 / 失效自动排除</p>
       </div>
       <NSpace>
         <NButton @click="onRefreshCredits">刷新额度</NButton>
         <NButton @click="showImport = true">批量导入</NButton>
-        <NButton type="primary" @click="showCreate = true">添加 Key</NButton>
+        <NButton type="primary" @click="showCreate = true">添加密钥</NButton>
       </NSpace>
     </div>
 
     <NAlert type="info" :bordered="false" style="margin-bottom: 16px">
-      所有下游 Client 共享同一上游 Key 池。不再按 Client 分池，也不再设置 Key daily quota。
-      失效 Key 自动禁用且停止额度刷新；客户端遇 429 / 额度问题 / Key 失效时自动换 Key 重试。
+      所有下游客户端共享同一上游密钥池。不再按客户端分池，也不再设置密钥日配额。
+      失效密钥自动禁用且停止额度刷新；客户端遇 429 / 额度问题 / 密钥失效时自动换密钥重试。
     </NAlert>
 
     <NCard :bordered="false" class="panel">
       <NSpace style="margin-bottom: 12px" align="center">
-        <NInput v-model:value="q" clearable placeholder="搜索名称 / last4" style="width: 220px" @keyup.enter="load" />
-        <NSelect v-model:value="provider" clearable :options="providerOptions" placeholder="Provider" style="width: 140px" />
-        <NButton @click="load">查询</NButton>
+        <NInput v-model:value="q" clearable placeholder="搜索名称 / 末四位" style="width: 220px" @keyup.enter="onSearch" />
+        <NSelect v-model:value="provider" clearable :options="providerOptions" placeholder="上游服务" style="width: 140px" />
+        <NSelect v-model:value="statusFilter" clearable :options="statusFilterOptions" placeholder="状态" style="width: 130px" />
+        <NButton @click="onSearch">查询</NButton>
         <NButton :disabled="!checked.length" @click="onBatchDisable">批量禁用</NButton>
+        <NButton :disabled="!checked.length" type="error" secondary @click="onBatchDelete">批量删除</NButton>
       </NSpace>
 
       <NDataTable
@@ -325,26 +451,22 @@ const columns = computed(() => [
         :columns="columns as any"
         :data="keys"
         :loading="loading"
+        :remote="true"
         :row-key="(r: KeyItem) => r.id"
-        :pagination="{
-          page,
-          pageSize,
-          itemCount: total,
-          onUpdatePage: (p: number) => { page = p; load(); },
-          onUpdatePageSize: (ps: number) => { pageSize = ps; page = 1; load(); },
-        }"
+        :pagination="pagination as any"
+        @update:sorter="onSort"
       />
     </NCard>
 
-    <NModal v-model:show="showCreate" preset="card" title="添加上游 Key" style="width: 480px">
+    <NModal v-model:show="showCreate" preset="card" title="添加上游密钥" style="width: 480px">
       <NForm label-placement="left" label-width="110">
-        <NFormItem label="API Key" required>
+        <NFormItem label="上游密钥" required>
           <NInput v-model:value="createForm.api_key" type="password" show-password-on="click" placeholder="fc-..." />
         </NFormItem>
         <NFormItem label="名称">
           <NInput v-model:value="createForm.name" placeholder="可选备注" />
         </NFormItem>
-        <NFormItem label="Provider">
+        <NFormItem label="上游服务">
           <NSelect v-model:value="createForm.provider" :options="providerOptions" />
         </NFormItem>
         <NFormItem label="软并发上限">
@@ -362,12 +484,12 @@ const columns = computed(() => [
       </template>
     </NModal>
 
-    <NModal v-model:show="showImport" preset="card" title="批量导入 Key" style="width: 560px">
+    <NModal v-model:show="showImport" preset="card" title="批量导入密钥" style="width: 560px">
       <NForm label-placement="top">
-        <NFormItem label="Provider">
+        <NFormItem label="上游服务">
           <NSelect v-model:value="importProvider" :options="providerOptions" />
         </NFormItem>
-        <NFormItem label="每行一个 Key（支持 user|pass|api_key|verified_at）">
+        <NFormItem label="每行一个密钥（支持 用户|密码|密钥|验证时间）">
           <NInput v-model:value="importText" type="textarea" :rows="10" placeholder="fc-xxx&#10;fc-yyy" />
         </NFormItem>
       </NForm>

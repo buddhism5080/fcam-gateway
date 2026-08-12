@@ -27,6 +27,8 @@ export type CreateClientRequest = {
   max_concurrent?: number;
   max_retries?: number;
   is_active?: boolean;
+  /** Optional manual token; omit or empty to auto-generate. */
+  token?: string | null;
 };
 
 export async function createClient(payload: CreateClientRequest) {
@@ -36,6 +38,13 @@ export async function createClient(payload: CreateClientRequest) {
 
 export async function rotateClientToken(clientId: number) {
   const res = await http.post<{ client_id: number; token: string }>(`/admin/clients/${clientId}/rotate`);
+  return res.data;
+}
+
+export async function revealClientToken(clientId: number) {
+  const res = await http.get<{ client_id: number; name: string; token: string }>(
+    `/admin/clients/${clientId}/token`,
+  );
   return res.data;
 }
 

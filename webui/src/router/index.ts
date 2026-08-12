@@ -5,6 +5,7 @@ import ClientsView from "@/views/ClientsView.vue";
 import DashboardView from "@/views/DashboardView.vue";
 import KeysView from "@/views/KeysView.vue";
 import LogsView from "@/views/LogsView.vue";
+import SettingsView from "@/views/SettingsView.vue";
 
 const router = createRouter({
   history: createWebHashHistory("/ui2/"),
@@ -17,6 +18,7 @@ const router = createRouter({
     { path: "/clients-keys", redirect: "/keys" },
     { path: "/logs", component: LogsView },
     { path: "/audit", component: AuditView },
+    { path: "/settings", component: SettingsView },
   ],
 });
 

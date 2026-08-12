@@ -25,9 +25,27 @@ coverage.xml
 !.env.example
 
 data/
+data-local/
 logs/
 example/
 app/ui2/
+
+# Local daemon runtime (env, pid, logs, imported keys, client tokens)
+run/
+*_local.env
+*.pid
+*.log
+
+# SQLite / local DB dumps
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Temp exports / plaintext key dumps (never commit)
+_tmp*/
+**/import_active_keys.txt
+**/client-tokens.txt
 
 # Windows reserved-name artifact that breaks some tools (e.g. ripgrep).
 nul

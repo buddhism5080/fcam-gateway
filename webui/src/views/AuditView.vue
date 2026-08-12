@@ -5,6 +5,7 @@ import { computed, h, onMounted, reactive, ref, watch } from "vue";
 import { fetchAuditLogs, type AuditLogItem } from "@/api/logs";
 import { getFcamErrorMessage } from "@/api/http";
 import { adminToken } from "@/state/adminAuth";
+import { displayTimezone } from "@/state/timezone";
 import { formatTimestamp } from "@/utils/time";
 
 const message = useMessage();
@@ -124,9 +125,9 @@ const columnLabels: Record<string, string> = {
   created_at: "时间",
   action: "操作",
   resource_type: "资源类型",
-  resource_id: "资源ID",
-  ip: "IP地址",
-  user_agent: "User Agent",
+  resource_id: "资源 ID",
+  ip: "IP 地址",
+  user_agent: "用户代理",
 };
 
 // 从 localStorage 加载可见列配置
@@ -155,27 +156,30 @@ watch(visibleColumns, (cols) => {
   }
 }, { deep: true });
 
-const columns = [
+const columns = computed(() => {
+  void displayTimezone.value;
+  return [
   {
     title: "时间",
     key: "created_at",
     width: 170,
     render: (row: AuditLogItem) => formatTimestamp(row.created_at)
   },
-  { title: "action", key: "action", width: 220 },
-  { title: "resource_type", key: "resource_type", width: 130 },
-  { title: "resource_id", key: "resource_id", width: 140 },
-  { title: "ip", key: "ip", width: 140 },
+  { title: "操作", key: "action", width: 220 },
+  { title: "资源类型", key: "resource_type", width: 130 },
+  { title: "资源 ID", key: "resource_id", width: 140 },
+  { title: "IP 地址", key: "ip", width: 140 },
   {
-    title: "user_agent",
+    title: "用户代理",
     key: "user_agent",
     render: (row: AuditLogItem) => h("span", { style: "color: var(--text-tertiary)" }, row.user_agent || "-"),
   },
 ];
+});
 
 // 根据用户选择过滤列
 const filteredColumns = computed(() => {
-  return columns.filter(col => visibleColumns.value.includes(col.key));
+  return columns.value.filter(col => visibleColumns.value.includes(col.key));
 });
 
 // 列选择选项
@@ -210,9 +214,9 @@ const columnOptions = computed(() => {
     <n-space vertical>
       <n-space>
         <n-select v-model:value="pageSize" size="small" :options="pageSizeOptions" style="width: 120px" />
-        <n-input v-model:value="filters.action" size="small" placeholder="action" style="width: 220px" />
-        <n-input v-model:value="filters.resource_type" size="small" placeholder="resource_type" style="width: 160px" />
-        <n-input v-model:value="filters.resource_id" size="small" placeholder="resource_id" style="width: 180px" />
+        <n-input v-model:value="filters.action" size="small" placeholder="操作" style="width: 220px" />
+        <n-input v-model:value="filters.resource_type" size="small" placeholder="资源类型" style="width: 160px" />
+        <n-input v-model:value="filters.resource_id" size="small" placeholder="资源 ID" style="width: 180px" />
       </n-space>
 
       <n-data-table

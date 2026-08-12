@@ -9,22 +9,25 @@ import {
   NLayout,
   NLayoutContent,
   NLayoutHeader,
-  NSpace,
   NTag,
+  zhCN,
+  dateZhCN,
 } from "naive-ui";
 import { computed, onMounted, ref } from "vue";
 
 import ConnectModal from "@/components/ConnectModal.vue";
+import TimezoneSelect from "@/components/TimezoneSelect.vue";
 import { adminToken, connectionStatus, disconnectAdminToken, verifyAdminToken } from "@/state/adminAuth";
 
 const showConnect = ref(false);
 
 const navItems = [
   { to: "/dashboard", label: "仪表盘" },
-  { to: "/keys", label: "上游 Keys" },
-  { to: "/clients", label: "下游 Clients" },
+  { to: "/keys", label: "上游密钥" },
+  { to: "/clients", label: "下游客户端" },
   { to: "/logs", label: "请求日志" },
   { to: "/audit", label: "审计日志" },
+  { to: "/settings", label: "参数设置" },
 ] as const;
 
 const statusTag = computed(() => {
@@ -109,7 +112,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <n-config-provider :theme-overrides="themeOverrides">
+  <n-config-provider :theme-overrides="themeOverrides" :locale="zhCN" :date-locale="dateZhCN">
     <n-loading-bar-provider>
       <n-message-provider placement="top-right">
         <n-dialog-provider>
@@ -128,6 +131,7 @@ onMounted(async () => {
                 </nav>
 
                 <div class="header-actions">
+                  <timezone-select />
                   <n-tag size="small" :type="statusTag.type">{{ statusTag.label }}</n-tag>
                   <n-button size="small" @click="showConnect = true">连接</n-button>
                   <n-button v-if="adminToken" size="small" @click="disconnectAdminToken">断开</n-button>
@@ -173,11 +177,11 @@ onMounted(async () => {
   align-items: center;
   justify-content: space-between;
   padding: 10px 0;
-  overflow-x: auto;
-  max-width: 1200px;
+  max-width: 1280px;
   margin: 0 auto;
-  position: relative;
-  gap: 12px;
+  gap: 16px;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .header-brand {
@@ -185,7 +189,6 @@ onMounted(async () => {
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
-  z-index: 2;
 }
 
 .brand-icon {
@@ -213,22 +216,24 @@ onMounted(async () => {
   line-height: 1;
 }
 
+/* Flex middle zone — no absolute centering (that overlapped timezone / 参数设置). */
 .header-nav {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 1;
   display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 4px;
+  flex-wrap: nowrap;
   justify-content: center;
+  align-items: center;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 .nav-link {
   display: inline-flex;
   align-items: center;
   height: 36px;
-  padding: 0 12px;
+  padding: 0 10px;
   border-radius: 10px;
   color: var(--text-secondary);
   text-decoration: none;
@@ -238,6 +243,9 @@ onMounted(async () => {
     border-color 0.2s ease,
     color 0.2s ease;
   white-space: nowrap;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
 }
 
 .nav-link:hover {
@@ -253,10 +261,11 @@ onMounted(async () => {
 }
 
 .header-actions {
-  flex-shrink: 0;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 8px;
+  position: relative;
   z-index: 2;
 }
 
@@ -264,7 +273,7 @@ onMounted(async () => {
   flex: 1;
   overflow: auto;
   background: transparent;
-  max-width: 1200px;
+  max-width: 1280px;
   margin: 0 auto;
   width: 100%;
 }
@@ -274,12 +283,18 @@ onMounted(async () => {
   min-height: calc(100vh - 68px);
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1100px) {
+  .header-content {
+    flex-wrap: wrap;
+  }
   .header-nav {
-    position: static;
-    transform: none;
+    order: 3;
+    flex: 1 1 100%;
     justify-content: flex-start;
-    flex: 1;
+    padding-top: 4px;
+  }
+  .header-actions {
+    margin-left: auto;
   }
 }
 </style>

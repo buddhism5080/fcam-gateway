@@ -47,13 +47,24 @@ export type KeyListResponse = {
 };
 
 export async function fetchKeys(
-  opts: { page?: number; pageSize?: number; q?: string; provider?: string } = {}
+  opts: {
+    page?: number;
+    pageSize?: number;
+    q?: string;
+    provider?: string;
+    status?: string;
+    sortBy?: string;
+    sortOrder?: "asc" | "desc";
+  } = {}
 ) {
   const params: Record<string, number | string> = {};
   if (opts.page) params.page = opts.page;
   if (opts.pageSize) params.page_size = opts.pageSize;
   if (opts.q) params.q = opts.q;
   if (opts.provider) params.provider = opts.provider;
+  if (opts.status) params.status = opts.status;
+  if (opts.sortBy) params.sort_by = opts.sortBy;
+  if (opts.sortOrder) params.sort_order = opts.sortOrder;
   const res = await http.get<KeyListResponse>("/admin/keys", {
     params: Object.keys(params).length ? params : undefined,
   });
@@ -170,6 +181,7 @@ export type BatchKeysRequest = {
   patch?: BatchKeyPatch;
   reset_cooldown?: boolean;
   soft_delete?: boolean;
+  purge?: boolean;
   test?: BatchKeyTest;
 };
 

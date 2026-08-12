@@ -101,10 +101,14 @@ class RateLimitConfig(BaseModel):
 
 class CreditMonitoringSmartRefreshConfig(BaseModel):
     enabled: bool = True
-    high_usage_interval: int = 15
-    medium_usage_interval: int = 30
-    normal_usage_interval: int = 60
-    low_usage_interval: int = 120
+    # Minutes between credit probes by usage tier (high usage → refresh more often).
+    high_usage_interval: int = 30
+    medium_usage_interval: int = 60
+    normal_usage_interval: int = 120
+    low_usage_interval: int = 240
+    # When remaining credits are plentiful, never refresh more often than this (minutes).
+    abundant_remaining_threshold: int = 1000
+    abundant_min_interval_minutes: int = 120
 
 
 class CreditMonitoringFixedRefreshConfig(BaseModel):
@@ -142,7 +146,16 @@ class SchedulingConfig(BaseModel):
     """Scientific upstream key selection weights."""
 
     freshness_half_life_seconds: int = 6 * 3600
+    # Assumed **remaining credits** when cache is unknown. Score uses log1p(this value),
+    # same as known keys: e.g. 50 → weight log1p(50) ≈ ln(51), not raw weight 50.
     unknown_credit_baseline: float = 50.0
+    # With probability epsilon, explore via round-robin among RPM-eligible keys (not only top score).
+    epsilon_greedy: float = 0.1
+    # Keys with score >= best * near_score_ratio share weighted random pick (exploit path).
+    near_score_ratio: float = 0.95
+    # Non-network failure score penalty: failure_weight = 1/(1 + decayed_count * unit)
+    failure_penalty_half_life_seconds: float = 300.0
+    failure_penalty_unit: float = 1.0
 
 
 class IdempotencyConfig(BaseModel):

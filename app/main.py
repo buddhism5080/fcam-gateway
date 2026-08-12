@@ -129,12 +129,24 @@ def create_app(*, config: AppConfig | None = None, secrets: Secrets | None = Non
     app.state.key_pool = KeyPool(
         cooldown_store=app.state.cooldown_store,
         runtime_settings=None,  # set below after runtime_settings init
+        rate_limiter=app.state.key_rate_limiter,
     )
-    app.state.runtime_settings = RuntimeSettings(scheduling=config.scheduling)
+    from app.core.runtime_settings import default_runtime_settings_path
+
+    db_path = getattr(config.database, "path", None) if getattr(config, "database", None) else None
+    runtime_path = default_runtime_settings_path(database_path=str(db_path) if db_path else None)
+    app.state.runtime_settings = RuntimeSettings(
+        scheduling=config.scheduling,
+        persist_path=runtime_path,
+        load_persisted=True,
+    )
     app.state.key_pool._runtime_settings = app.state.runtime_settings  # noqa: SLF001 — wire after both exist
+    app.state.key_pool.set_rate_limiter(app.state.key_rate_limiter)
     http_cfg = config.security.http_client
+    file_pool = bool(http_cfg.connection_pool_enabled)
+    pool_enabled = bool(app.state.runtime_settings.effective_http_connection_pool_enabled(file_pool))
     app.state.http_pool = UpstreamHttpPool(
-        enabled=bool(http_cfg.connection_pool_enabled),
+        enabled=pool_enabled,
         max_connections=int(http_cfg.max_connections),
         max_keepalive_connections=int(http_cfg.max_keepalive_connections),
         keepalive_expiry=float(http_cfg.keepalive_expiry_seconds),

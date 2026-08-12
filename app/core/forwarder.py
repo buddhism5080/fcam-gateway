@@ -209,6 +209,47 @@ class Forwarder:
     def _http_acquire(self, *, base_url: str, timeout: httpx.Timeout):
         return self._http_pool.acquire(base_url=base_url, timeout=timeout)
 
+    def _refresh_credits_on_4xx(
+        self,
+        db: Session,
+        key: ApiKey,
+        *,
+        status_code: int,
+        request_id: str | None = None,
+    ) -> None:
+        """
+        On upstream 4xx: record score penalty, immediately refresh this key's credits,
+        so subsequent selection uses updated remaining + freshness in score_key.
+        """
+        try:
+            self._key_pool.record_failure(int(key.id), f"upstream_4xx_{status_code}", status_code=int(status_code))
+        except Exception:
+            pass
+        try:
+            from app.core.credit_fetcher import refresh_credits_after_4xx
+
+            refresh_credits_after_4xx(
+                db=db,
+                key=key,
+                master_key=self._master_key,
+                config=self._config,
+                request_id=request_id,
+                status_code=int(status_code),
+            )
+        except Exception:
+            logger.exception(
+                "credit.4xx_refresh_hook_failed",
+                extra={"fields": {"api_key_id": getattr(key, "id", None), "status_code": status_code}},
+            )
+
+    def _record_upstream_success(self, key_id: int | None) -> None:
+        if key_id is None:
+            return
+        try:
+            self._key_pool.record_success(int(key_id))
+        except Exception:
+            pass
+
     def _record_switch(self, reason: str, switch_reasons: list[str]) -> None:
         switch_reasons.append(reason)
         if self._metrics is not None:
@@ -472,6 +513,7 @@ class Forwarder:
                             lease.release()
 
                         if resp.status_code == 429:
+                            self._refresh_credits_on_4xx(db, pinned_key, status_code=429, request_id=request_id)
                             cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
                             self._mark_cooling(db, pinned_key, cooldown)
                             # Pinned: cannot switch keys; retry same key after cooldown mark only once budget
@@ -487,6 +529,9 @@ class Forwarder:
                             continue
 
                         if resp.status_code in {401, 403}:
+                            self._refresh_credits_on_4xx(
+                                db, pinned_key, status_code=int(resp.status_code), request_id=request_id
+                            )
                             self._disable_key(db, pinned_key, resp.status_code)
                             return ForwardResult(
                                 response=_to_fastapi_response(resp),
@@ -498,7 +543,7 @@ class Forwarder:
                                 )
 
                         if resp.status_code >= 500:
-                            self._record_failure(db, pinned_key, reason="upstream_5xx")
+                            self._record_failure(db, pinned_key, reason="upstream_5xx", status_code=resp.status_code)
                             if attempt >= total_attempts - 1:
                                 return ForwardResult(
                                     response=_to_fastapi_response(resp),
@@ -509,6 +554,11 @@ class Forwarder:
                                     selection_score=selection_score,
                                 )
                             continue
+
+                        if 400 <= resp.status_code < 500:
+                            self._refresh_credits_on_4xx(
+                                db, pinned_key, status_code=int(resp.status_code), request_id=request_id
+                            )
 
                         credit_changed = False
                         if 200 <= resp.status_code < 300:
@@ -565,6 +615,7 @@ class Forwarder:
                                         "db.credit_local_update_commit_failed",
                                         extra={"fields": {"request_id": request_id, "api_key_id": pinned_key.id}},
                                     )
+                            self._record_upstream_success(last_api_key_id)
 
                         return ForwardResult(
                             response=_to_fastapi_response(resp),
@@ -717,6 +768,9 @@ class Forwarder:
                 # --- Auto switch key on 429 / invalid / credit issues (do NOT leak to client yet) ---
                 if resp.status_code == 429 or _looks_like_credit_error(resp):
                     tried_key_ids.add(key.id)
+                    # Immediate credit refresh + 4xx score penalty (use real status when 4xx)
+                    sc = int(resp.status_code) if 400 <= int(resp.status_code) < 500 else 429
+                    self._refresh_credits_on_4xx(db, key, status_code=sc, request_id=request_id)
                     if resp.status_code == 429 and not _looks_like_credit_error(resp):
                         cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
                         self._mark_cooling(db, key, cooldown)
@@ -745,6 +799,9 @@ class Forwarder:
 
                 if resp.status_code in {401, 403}:
                     tried_key_ids.add(key.id)
+                    self._refresh_credits_on_4xx(
+                        db, key, status_code=int(resp.status_code), request_id=request_id
+                    )
                     self._disable_key(db, key, resp.status_code)
                     last_error_response = resp
                     retry_count += 1
@@ -760,7 +817,7 @@ class Forwarder:
                     continue
 
                 if resp.status_code >= 500:
-                    self._record_failure(db, key, reason="upstream_5xx")
+                    self._record_failure(db, key, reason="upstream_5xx", status_code=resp.status_code)
                     last_error_response = resp
                     retry_count += 1
                     if upstream_attempts >= total_attempts:
@@ -773,6 +830,12 @@ class Forwarder:
                                     selection_score=selection_score,
                                 )
                     continue
+
+                # Other 4xx (e.g. 400/404/422): score penalty + immediate credit refresh
+                if 400 <= resp.status_code < 500:
+                    self._refresh_credits_on_4xx(
+                        db, key, status_code=int(resp.status_code), request_id=request_id
+                    )
 
                 credit_changed = False
                 if 200 <= resp.status_code < 300:
@@ -829,6 +892,7 @@ class Forwarder:
                                 "db.credit_local_update_commit_failed",
                                 extra={"fields": {"request_id": request_id, "api_key_id": key.id}},
                             )
+                    self._record_upstream_success(last_api_key_id)
 
                 return ForwardResult(
                     response=_to_fastapi_response(resp),
@@ -1040,7 +1104,7 @@ class Forwarder:
             )
 
         if resp.status_code >= 500:
-            self._record_failure(db, key, reason="upstream_5xx")
+            self._record_failure(db, key, reason="upstream_5xx", status_code=resp.status_code)
             logger.info(
                 "upstream.key_test_5xx",
                 extra={
@@ -1147,7 +1211,7 @@ class Forwarder:
             self._disable_key(db, key, resp.status_code)
 
         if resp.status_code >= 500:
-            self._record_failure(db, key, reason="upstream_5xx")
+            self._record_failure(db, key, reason="upstream_5xx", status_code=resp.status_code)
 
         return KeyTestResult(
             ok=False,
@@ -1233,9 +1297,21 @@ class Forwarder:
             db.rollback()
             logger.exception("db.key_disable_failed", extra={"fields": {"api_key_id": key.id}})
 
-    def _record_failure(self, db: Session, key: ApiKey, reason: str) -> None:
+    def _record_failure(
+        self,
+        db: Session,
+        key: ApiKey,
+        reason: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
         if not key.is_active or key.status == "disabled":
             return
+        # Score path: only HTTP 4xx reduce selection score (5xx/network ignored inside pool).
+        try:
+            self._key_pool.record_failure(int(key.id), reason, status_code=status_code)
+        except Exception:
+            pass
         now = datetime.now(timezone.utc)
         with self._failure_lock:
             count, first_at = self._failures.get(key.id, (0, now))

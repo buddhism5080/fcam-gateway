@@ -41,6 +41,25 @@ class UpstreamHttpPool:
     def enabled(self) -> bool:
         return self._enabled
 
+    def set_enabled(self, enabled: bool) -> None:
+        """Hot-toggle connection reuse. Disabling closes pooled clients."""
+        want = bool(enabled)
+        with self._lock:
+            if self._enabled == want:
+                return
+            self._enabled = want
+            if want:
+                logger.info("http_pool.enabled", extra={"fields": {"enabled": True}})
+                return
+            clients = list(self._clients.values())
+            self._clients.clear()
+        logger.info("http_pool.disabled", extra={"fields": {"enabled": False, "closed": len(clients)}})
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                logger.exception("http_pool.close_failed")
+
     def _make_client(self, *, base_url: str, timeout: httpx.Timeout) -> httpx.Client:
         kwargs: dict = {
             "base_url": base_url,

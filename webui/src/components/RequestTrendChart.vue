@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
+import { formatClockTime } from "@/utils/time";
 
 type Dataset = { label: string; color: string; data: number[] };
 
@@ -55,8 +56,7 @@ const xLabels = computed(() => {
 });
 
 function fmtTime(raw: string) {
-  const d = new Date(raw);
-  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  return formatClockTime(raw);
 }
 
 function linePoints(data: number[]) {

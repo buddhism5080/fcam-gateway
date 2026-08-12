@@ -21,11 +21,15 @@ from app.core.batch_clients import apply_batch_action_to_client, deduplicate_cli
 from app.core.key_import import parse_keys_text
 from app.core.security import (
     decrypt_api_key,
+    decrypt_client_token,
     derive_master_key_bytes,
     encrypt_account_password,
     encrypt_api_key,
+    encrypt_client_token,
+    generate_client_token,
     hmac_sha256_hex,
     mask_api_key_last4,
+    validate_client_token_complexity,
 )
 from app.core.time import today_in_timezone
 from app.db.models import ApiKey, AuditLog, Client, CreditSnapshot, IdempotencyRecord, RequestLog
@@ -226,6 +230,8 @@ class BatchKeysRequest(BaseModel):
     patch: BatchKeyPatch | None = None
     reset_cooldown: bool = False
     soft_delete: bool = False
+    # Hard-delete rows from DB (same as single-key purge). Mutually exclusive intent with soft_delete.
+    purge: bool = False
     test: BatchKeyTest | None = None
 
 
@@ -247,6 +253,8 @@ class CreateClientRequest(BaseModel):
     max_concurrent: int = Field(default=10, ge=0)
     max_retries: int = Field(default=3, ge=0, le=50, description="Upstream key-switch retries on 429/invalid/credit")
     is_active: bool = True
+    # Optional manual token; empty/null → server generates a strong token.
+    token: str | None = Field(default=None, max_length=256, description="Optional manual client token")
 
 
 class UpdateClientRequest(BaseModel):
@@ -283,11 +291,38 @@ def list_keys(
     page_size: int | None = Query(default=None, ge=1, le=200),
     q_: str | None = Query(default=None, alias="q"),
     provider: str | None = Query(default=None),
+    status: str | None = Query(default=None, description="Filter by key status, e.g. active/cooling/failed/disabled"),
+    sort_by: str | None = Query(default="id"),
+    sort_order: str | None = Query(default="desc"),
 ) -> dict[str, Any]:
     try:
-        q = db.query(ApiKey).order_by(ApiKey.id.desc())
+        sort_key = (sort_by or "id").strip().lower()
+        order = (sort_order or "desc").strip().lower()
+        if order not in {"asc", "desc"}:
+            order = "desc"
+        sortable = {
+            "id": ApiKey.id,
+            "name": ApiKey.name,
+            "provider": ApiKey.provider,
+            "status": ApiKey.status,
+            "cached_remaining_credits": ApiKey.cached_remaining_credits,
+            "total_requests": ApiKey.total_requests,
+            "last_credit_check_at": ApiKey.last_credit_check_at,
+            "next_refresh_at": ApiKey.next_refresh_at,
+            "created_at": ApiKey.created_at,
+            "last_used_at": ApiKey.last_used_at,
+            "is_active": ApiKey.is_active,
+        }
+        col = sortable.get(sort_key, ApiKey.id)
+        # selection_score is computed — fall back to id order; client can re-sort page if needed
+        if sort_key == "selection_score":
+            col = ApiKey.cached_remaining_credits
+        q = db.query(ApiKey).order_by(col.asc() if order == "asc" else col.desc())
         if provider is not None:
             q = q.filter(ApiKey.provider == provider)
+        if status is not None and str(status).strip():
+            st = str(status).strip().lower()
+            q = q.filter(func.lower(ApiKey.status) == st)
         if client_id is not None:
             if client_id == 0:
                 q = q.filter(ApiKey.client_id.is_(None))
@@ -1064,10 +1099,27 @@ def batch_keys(
                         key.status = "active"
                     changed = True
 
-            if payload.soft_delete:
+            if payload.soft_delete and not payload.purge:
                 key.is_active = False
                 key.status = "disabled"
                 changed = True
+
+            if payload.purge:
+                db.query(RequestLog).filter(RequestLog.api_key_id == key.id).update(
+                    {RequestLog.api_key_id: None},
+                    synchronize_session=False,
+                )
+                _audit(
+                    db,
+                    request=request,
+                    action="key.batch_purge",
+                    resource_type=f"api_key:{key.provider}",
+                    resource_id=str(key.id),
+                )
+                db.delete(key)
+                db.commit()
+                results.append({"id": key_id, "ok": True, "key": None, "test": None, "purged": True})
+                continue
 
             if changed:
                 _audit(
@@ -1218,14 +1270,24 @@ def create_client(
     if not secrets.master_key:
         raise FcamError(status_code=503, code="NOT_READY", message="Master key not configured")
 
-    token = f"fcam_client_{py_secrets.token_urlsafe(32)}"
     master_key_bytes = derive_master_key_bytes(secrets.master_key)
+    raw_token = (payload.token or "").strip() if getattr(payload, "token", None) else ""
+    if raw_token:
+        try:
+            validate_client_token_complexity(raw_token)
+        except ValueError as exc:
+            raise FcamError(status_code=400, code="VALIDATION_ERROR", message=str(exc)) from exc
+        token = raw_token
+    else:
+        token = generate_client_token()
     token_hash = hmac_sha256_hex(master_key_bytes, token)
+    token_ciphertext = encrypt_client_token(master_key_bytes, token)
 
     today = today_in_timezone(config.quota.timezone)
     client = Client(
         name=payload.name,
         token_hash=token_hash,
+        token_ciphertext=token_ciphertext,
         is_active=payload.is_active,
         status="active" if payload.is_active else "disabled",
         daily_quota=payload.daily_quota,
@@ -1353,9 +1415,10 @@ def rotate_client_token(
     if client is None:
         raise FcamError(status_code=404, code="NOT_FOUND", message="Not found")
 
-    token = f"fcam_client_{py_secrets.token_urlsafe(32)}"
+    token = generate_client_token()
     master_key_bytes = derive_master_key_bytes(secrets.master_key)
     client.token_hash = hmac_sha256_hex(master_key_bytes, token)
+    client.token_ciphertext = encrypt_client_token(master_key_bytes, token)
 
     try:
         _audit(db, request=request, action="client.rotate", resource_type="client", resource_id=str(client.id))
@@ -1366,6 +1429,48 @@ def rotate_client_token(
         raise FcamError(status_code=503, code="DB_UNAVAILABLE", message="Database unavailable") from exc
 
     return {"client_id": client.id, "token": token}
+
+
+@router.get("/clients/{client_id}/token")
+def reveal_client_token(
+    request: Request,
+    client_id: int,
+    db: Session = Depends(get_db),
+    secrets: Secrets = Depends(get_secrets),
+) -> dict[str, Any]:
+    """Re-display stored client token (requires token_ciphertext from create/rotate after this feature)."""
+    if not secrets.master_key:
+        raise FcamError(status_code=503, code="NOT_READY", message="Master key not configured")
+
+    client = db.query(Client).filter(Client.id == client_id).one_or_none()
+    if client is None or client.status == "deleted":
+        raise FcamError(status_code=404, code="NOT_FOUND", message="Not found")
+
+    blob = getattr(client, "token_ciphertext", None)
+    if not blob:
+        raise FcamError(
+            status_code=404,
+            code="TOKEN_NOT_STORED",
+            message="该客户端创建于可再显示功能之前，库中无密文令牌。请轮换令牌后即可再次查看。",
+        )
+
+    master_key_bytes = derive_master_key_bytes(secrets.master_key)
+    try:
+        token = decrypt_client_token(master_key_bytes, bytes(blob))
+    except Exception as exc:
+        raise FcamError(
+            status_code=500,
+            code="DECRYPTION_FAILED",
+            message="无法解密客户端令牌，请检查 FCAM_MASTER_KEY 或轮换令牌",
+        ) from exc
+
+    try:
+        _audit(db, request=request, action="client.token_reveal", resource_type="client", resource_id=str(client.id))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return {"client_id": client.id, "name": client.name, "token": token}
 
 
 @router.patch("/clients/batch", dependencies=[Depends(require_admin)])
@@ -1944,50 +2049,113 @@ class RuntimeSchedulingUpdate(BaseModel):
     unknown_credit_baseline: float | None = Field(default=None, ge=0, le=1_000_000)
     credit_workers: int | None = Field(default=None, ge=1, le=64)
     clear_credit_workers_override: bool = False
+    http_connection_pool_enabled: bool | None = None
+    clear_http_connection_pool_override: bool = False
+    credit_batch_size: int | None = Field(default=None, ge=1, le=500)
+    clear_credit_batch_size: bool = False
+    credit_batch_delay_seconds: int | None = Field(default=None, ge=0, le=3600)
+    clear_credit_batch_delay_seconds: bool = False
+    credit_refresh_check_interval_seconds: int | None = Field(default=None, ge=1, le=86400)
+    clear_credit_refresh_check_interval_seconds: bool = False
+    credit_retry_delay_minutes: int | None = Field(default=None, ge=1, le=1440)
+    clear_credit_retry_delay_minutes: bool = False
+    epsilon_greedy: float | None = Field(default=None, ge=0, le=1)
+    clear_epsilon_greedy: bool = False
     model_config = {"extra": "forbid"}
 
 
-@router.get("/runtime/scheduling")
-def get_runtime_scheduling(request: Request) -> dict[str, Any]:
+def _runtime_pool_enabled(request: Request, runtime: object | None = None) -> bool:
+    cfg = request.app.state.config
+    file_pool = bool(cfg.security.http_client.connection_pool_enabled)
+    http_pool = getattr(request.app.state, "http_pool", None)
+    if http_pool is not None and hasattr(http_pool, "enabled"):
+        return bool(http_pool.enabled)
+    if runtime is not None:
+        fn = getattr(runtime, "effective_http_connection_pool_enabled", None)
+        if callable(fn):
+            return bool(fn(file_pool))
+    return file_pool
+
+
+def _runtime_snapshot(request: Request) -> dict[str, Any]:
     cfg = request.app.state.config
     runtime = getattr(request.app.state, "runtime_settings", None)
     file_half = int(cfg.scheduling.freshness_half_life_seconds)
     file_base = float(cfg.scheduling.unknown_credit_baseline)
     file_workers = int(cfg.credit_monitoring.workers)
-    if runtime is None:
-        return {
-            "file": {
-                "freshness_half_life_seconds": file_half,
-                "unknown_credit_baseline": file_base,
-                "credit_workers": file_workers,
-            },
-            "effective": {
-                "freshness_half_life_seconds": file_half,
-                "unknown_credit_baseline": file_base,
-                "credit_workers": file_workers,
-            },
-            "overrides": {},
-            "http_connection_pool_enabled": bool(cfg.security.http_client.connection_pool_enabled),
-        }
-    rs = runtime.get_scheduling()
-    return {
-        "file": {
-            "freshness_half_life_seconds": file_half,
-            "unknown_credit_baseline": file_base,
-            "credit_workers": file_workers,
-        },
-        "effective": {
-            "freshness_half_life_seconds": int(runtime.effective_half_life(file_half)),
-            "unknown_credit_baseline": float(runtime.effective_unknown_baseline(file_base)),
-            "credit_workers": int(runtime.effective_credit_workers(file_workers)),
-        },
-        "overrides": {
+    file_pool = bool(cfg.security.http_client.connection_pool_enabled)
+    file_batch = int(cfg.credit_monitoring.batch_size)
+    file_batch_delay = int(cfg.credit_monitoring.batch_delay_seconds)
+    file_refresh_iv = int(cfg.credit_monitoring.refresh_check_interval_seconds)
+    file_retry = int(cfg.credit_monitoring.retry_delay_minutes)
+    file_eps = float(getattr(cfg.scheduling, "epsilon_greedy", 0.1) or 0.0)
+
+    def _eff(name: str, fallback):
+        if runtime is None:
+            return fallback
+        fn = getattr(runtime, name, None)
+        if not callable(fn):
+            return fallback
+        try:
+            return fn(fallback)
+        except Exception:
+            return fallback
+
+    effective_pool = _runtime_pool_enabled(request, runtime)
+    file_block = {
+        "freshness_half_life_seconds": file_half,
+        "unknown_credit_baseline": file_base,
+        "credit_workers": file_workers,
+        "http_connection_pool_enabled": file_pool,
+        "credit_batch_size": file_batch,
+        "credit_batch_delay_seconds": file_batch_delay,
+        "credit_refresh_check_interval_seconds": file_refresh_iv,
+        "credit_retry_delay_minutes": file_retry,
+        "epsilon_greedy": file_eps,
+    }
+    effective_block = {
+        "freshness_half_life_seconds": int(_eff("effective_half_life", file_half)),
+        "unknown_credit_baseline": float(_eff("effective_unknown_baseline", file_base)),
+        "credit_workers": int(_eff("effective_credit_workers", file_workers)),
+        "http_connection_pool_enabled": effective_pool,
+        "credit_batch_size": int(_eff("effective_credit_batch_size", file_batch)),
+        "credit_batch_delay_seconds": int(_eff("effective_credit_batch_delay_seconds", file_batch_delay)),
+        "credit_refresh_check_interval_seconds": int(
+            _eff("effective_credit_refresh_check_interval_seconds", file_refresh_iv)
+        ),
+        "credit_retry_delay_minutes": int(_eff("effective_credit_retry_delay_minutes", file_retry)),
+        "epsilon_greedy": float(_eff("effective_epsilon_greedy", file_eps)),
+    }
+    overrides: dict[str, Any] = {}
+    persist_path = None
+    if runtime is not None:
+        rs = runtime.get_scheduling()
+        overrides = {
             "freshness_half_life_seconds": rs.freshness_half_life_seconds,
             "unknown_credit_baseline": rs.unknown_credit_baseline,
             "credit_workers": rs.credit_workers,
-        },
-        "http_connection_pool_enabled": bool(cfg.security.http_client.connection_pool_enabled),
+            "http_connection_pool_enabled": rs.http_connection_pool_enabled,
+            "credit_batch_size": rs.credit_batch_size,
+            "credit_batch_delay_seconds": rs.credit_batch_delay_seconds,
+            "credit_refresh_check_interval_seconds": rs.credit_refresh_check_interval_seconds,
+            "credit_retry_delay_minutes": rs.credit_retry_delay_minutes,
+            "epsilon_greedy": getattr(rs, "epsilon_greedy", None),
+        }
+        pp = getattr(runtime, "persist_path", None)
+        persist_path = str(pp) if pp is not None else None
+    return {
+        "file": file_block,
+        "effective": effective_block,
+        "overrides": overrides,
+        "http_connection_pool_enabled": effective_pool,
+        "persisted": True,
+        "persist_path": persist_path,
     }
+
+
+@router.get("/runtime/scheduling")
+def get_runtime_scheduling(request: Request) -> dict[str, Any]:
+    return _runtime_snapshot(request)
 
 
 @router.put("/runtime/scheduling")
@@ -2004,13 +2172,33 @@ def put_runtime_scheduling(
         unknown_credit_baseline=payload.unknown_credit_baseline,
         credit_workers=payload.credit_workers,
         unset_credit_workers=bool(payload.clear_credit_workers_override),
+        http_connection_pool_enabled=payload.http_connection_pool_enabled,
+        clear_http_connection_pool_override=bool(payload.clear_http_connection_pool_override),
+        credit_batch_size=payload.credit_batch_size,
+        clear_credit_batch_size=bool(payload.clear_credit_batch_size),
+        credit_batch_delay_seconds=payload.credit_batch_delay_seconds,
+        clear_credit_batch_delay_seconds=bool(payload.clear_credit_batch_delay_seconds),
+        credit_refresh_check_interval_seconds=payload.credit_refresh_check_interval_seconds,
+        clear_credit_refresh_check_interval_seconds=bool(payload.clear_credit_refresh_check_interval_seconds),
+        credit_retry_delay_minutes=payload.credit_retry_delay_minutes,
+        clear_credit_retry_delay_minutes=bool(payload.clear_credit_retry_delay_minutes),
+        epsilon_greedy=payload.epsilon_greedy,
+        clear_epsilon_greedy=bool(payload.clear_epsilon_greedy),
+        persist=True,
     )
+    # Apply pool toggle live onto UpstreamHttpPool
+    cfg = request.app.state.config
+    file_pool = bool(cfg.security.http_client.connection_pool_enabled)
+    want_pool = bool(runtime.effective_http_connection_pool_enabled(file_pool))
+    http_pool = getattr(request.app.state, "http_pool", None)
+    if http_pool is not None and hasattr(http_pool, "set_enabled"):
+        http_pool.set_enabled(want_pool)
     _audit(db, request=request, action="runtime.scheduling.update", resource_type="runtime", resource_id="scheduling")
     try:
         db.commit()
     except Exception:
         db.rollback()
-    return get_runtime_scheduling(request)
+    return _runtime_snapshot(request)
 
 
 @router.get("/dashboard/clients")
