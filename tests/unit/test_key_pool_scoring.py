@@ -64,7 +64,7 @@ def test_only_4xx_reduces_score_not_5xx_or_network():
     pool.record_failure(7, "upstream_5xx", status_code=502)
     assert pool._failure_count(7, half_life_seconds=300) == 0
 
-    pool.record_failure(7, "upstream_4xx_422", status_code=422)
+    pool.record_failure(7, "key_4xx_429", status_code=429)
     pool.record_failure(7, "429", status_code=429)
     fails = pool._failure_count(7, half_life_seconds=300)
     assert fails >= 1.9
@@ -79,11 +79,16 @@ def test_only_4xx_reduces_score_not_5xx_or_network():
 def test_is_4xx_score_failure_helpers():
     assert is_4xx_score_failure(status_code=429) is True
     assert is_4xx_score_failure(status_code=401) is True
+    assert is_4xx_score_failure(status_code=402) is True
+    assert is_4xx_score_failure(status_code=403) is False
+    assert is_4xx_score_failure(status_code=400) is False
+    assert is_4xx_score_failure(status_code=422) is False
     assert is_4xx_score_failure(status_code=500) is False
     assert is_4xx_score_failure(status_code=200) is False
     assert is_4xx_score_failure(reason="timeout") is False
     assert is_4xx_score_failure(reason="upstream_5xx") is False
-    assert is_4xx_score_failure(reason="upstream_4xx_400") is True
+    assert is_4xx_score_failure(reason="upstream_4xx_400") is False
+    assert is_4xx_score_failure(reason="key_4xx_429") is True
     assert is_4xx_score_failure(reason="429") is True
 
 

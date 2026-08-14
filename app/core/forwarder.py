@@ -94,6 +94,44 @@ def _parse_retry_after(headers: httpx.Headers) -> int | None:
 
 _CREDIT_ERROR_MARKERS = ()  # kept for import compatibility; logic is inline in _looks_like_credit_error
 
+# Target-site / request problems — never disable or score-penalize the selected key.
+_SITE_OR_REQUEST_MARKERS = (
+    "do not support this site",
+    "we do not support this site",
+    "site is not supported",
+    "unsupported site",
+    "scrape_all_engines_failed",
+    "all scraping engines failed",
+    "website is blocking",
+    "website is down",
+    "page doesn't exist",
+    "page does not exist",
+    "requires authentication",
+    "url is invalid",
+    "invalid url",
+)
+
+# Auth wording that can appear on 401 or (rarely) 403 — key is actually bad.
+_INVALID_KEY_MARKERS = (
+    "invalid token",
+    "unauthorized: invalid",
+    "invalid api key",
+    "invalid key",
+    "api key is invalid",
+    "api key is missing",
+    "revoked",
+    "malformed token",
+)
+
+
+def _upstream_error_blob(resp: httpx.Response) -> str:
+    """Lowercased body preview (status + JSON code/error) for attribution."""
+    try:
+        raw = resp.content[:2048] if resp.content else b""
+        return raw.decode("utf-8", errors="replace").lower()
+    except Exception:
+        return ""
+
 
 def _looks_like_credit_error(resp: httpx.Response) -> bool:
     """Detect upstream responses that indicate the selected key is out of credits."""
@@ -103,11 +141,8 @@ def _looks_like_credit_error(resp: httpx.Response) -> bool:
     # Only inspect client-error bodies; never treat 2xx/5xx as credit exhaustion.
     if code < 400 or code >= 500:
         return False
-    try:
-        # Bound read — avoid materialising huge error bodies.
-        raw = resp.content[:2048] if resp.content else b""
-        text = raw.decode("utf-8", errors="replace").lower()
-    except Exception:
+    text = _upstream_error_blob(resp)
+    if not text:
         return False
     # Avoid overly broad markers like bare "remaining credits".
     markers = (
@@ -122,6 +157,55 @@ def _looks_like_credit_error(resp: httpx.Response) -> bool:
         "credits exhausted",
     )
     return any(m in text for m in markers)
+
+
+def _looks_like_site_or_request_error(resp: httpx.Response) -> bool:
+    """True when the failure is the target URL / request, not the selected key."""
+    code = int(resp.status_code)
+    text = _upstream_error_blob(resp)
+    if any(m in text for m in _SITE_OR_REQUEST_MARKERS):
+        return True
+    # Firecrawl request/validation / missing resource — same key would fail again.
+    if code in {400, 404, 405, 408, 409, 413, 414, 415, 422}:
+        return True
+    return False
+
+
+def _looks_like_invalid_key(resp: httpx.Response) -> bool:
+    """
+    True only when the body/status can be attributed to a bad/revoked key.
+
+    Bare 403 is *not* enough: Firecrawl uses 403 for \"we do not support this site\".
+    """
+    text = _upstream_error_blob(resp)
+    if any(m in text for m in _INVALID_KEY_MARKERS):
+        return True
+    if int(resp.status_code) == 401:
+        return True
+    return False
+
+
+def classify_upstream_outcome(resp: httpx.Response) -> str:
+    """
+    Attribute an upstream response to the key or to the request/site.
+
+    Returns one of: ok, credit, rate_limit, invalid_key, upstream_5xx, passthrough.
+    Only credit / rate_limit / invalid_key should punish or switch the selected key.
+    """
+    code = int(resp.status_code)
+    if 200 <= code < 300:
+        return "ok"
+    if _looks_like_credit_error(resp):
+        return "credit"
+    if code == 429:
+        return "rate_limit"
+    if _looks_like_invalid_key(resp):
+        return "invalid_key"
+    if _looks_like_site_or_request_error(resp):
+        return "passthrough"
+    if code >= 500:
+        return "upstream_5xx"
+    return "passthrough"
 
 
 def _client_retry_budget(client: Client, provider_max: int) -> int:
@@ -218,11 +302,12 @@ class Forwarder:
         request_id: str | None = None,
     ) -> None:
         """
-        On upstream 4xx: record score penalty, immediately refresh this key's credits,
-        so subsequent selection uses updated remaining + freshness in score_key.
+        On key-attributable 4xx (401/402/429): record score penalty, immediately
+        refresh this key's credits so subsequent selection uses updated remaining.
+        Target-site / request 4xx must not call this.
         """
         try:
-            self._key_pool.record_failure(int(key.id), f"upstream_4xx_{status_code}", status_code=int(status_code))
+            self._key_pool.record_failure(int(key.id), f"key_4xx_{status_code}", status_code=int(status_code))
         except Exception:
             pass
         try:
@@ -512,7 +597,8 @@ class Forwarder:
                         finally:
                             lease.release()
 
-                        if resp.status_code == 429:
+                        outcome = classify_upstream_outcome(resp)
+                        if outcome == "rate_limit":
                             self._refresh_credits_on_4xx(db, pinned_key, status_code=429, request_id=request_id)
                             cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
                             self._mark_cooling(db, pinned_key, cooldown)
@@ -528,7 +614,7 @@ class Forwarder:
                                 )
                             continue
 
-                        if resp.status_code in {401, 403}:
+                        if outcome == "invalid_key":
                             self._refresh_credits_on_4xx(
                                 db, pinned_key, status_code=int(resp.status_code), request_id=request_id
                             )
@@ -542,7 +628,17 @@ class Forwarder:
                                     selection_score=selection_score,
                                 )
 
-                        if resp.status_code >= 500:
+                        if outcome == "credit":
+                            self._refresh_credits_on_4xx(
+                                db, pinned_key, status_code=int(resp.status_code), request_id=request_id
+                            )
+                            try:
+                                pinned_key.cached_remaining_credits = 0
+                                db.commit()
+                            except Exception:
+                                db.rollback()
+
+                        if outcome == "upstream_5xx":
                             self._record_failure(db, pinned_key, reason="upstream_5xx", status_code=resp.status_code)
                             if attempt >= total_attempts - 1:
                                 return ForwardResult(
@@ -554,11 +650,6 @@ class Forwarder:
                                     selection_score=selection_score,
                                 )
                             continue
-
-                        if 400 <= resp.status_code < 500:
-                            self._refresh_credits_on_4xx(
-                                db, pinned_key, status_code=int(resp.status_code), request_id=request_id
-                            )
 
                         credit_changed = False
                         if 200 <= resp.status_code < 300:
@@ -765,25 +856,21 @@ class Forwarder:
                 finally:
                     lease.release()
 
-                # --- Auto switch key on 429 / invalid / credit issues (do NOT leak to client yet) ---
-                if resp.status_code == 429 or _looks_like_credit_error(resp):
+                # --- Auto switch key only when the failure is attributable to the key ---
+                outcome = classify_upstream_outcome(resp)
+                if outcome in {"rate_limit", "credit"}:
                     tried_key_ids.add(key.id)
-                    # Immediate credit refresh + 4xx score penalty (use real status when 4xx)
                     sc = int(resp.status_code) if 400 <= int(resp.status_code) < 500 else 429
                     self._refresh_credits_on_4xx(db, key, status_code=sc, request_id=request_id)
-                    if resp.status_code == 429 and not _looks_like_credit_error(resp):
+                    if outcome == "rate_limit":
                         cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
                         self._mark_cooling(db, key, cooldown)
                     else:
-                        # Credit exhaustion: zero out so scheduler skips this key
                         try:
                             key.cached_remaining_credits = 0
                             db.commit()
                         except Exception:
                             db.rollback()
-                        if resp.status_code == 429:
-                            cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
-                            self._mark_cooling(db, key, cooldown)
                     last_error_response = resp
                     retry_count += 1
                     if upstream_attempts >= total_attempts:
@@ -797,7 +884,7 @@ class Forwarder:
                                 )
                     continue
 
-                if resp.status_code in {401, 403}:
+                if outcome == "invalid_key":
                     tried_key_ids.add(key.id)
                     self._refresh_credits_on_4xx(
                         db, key, status_code=int(resp.status_code), request_id=request_id
@@ -816,7 +903,7 @@ class Forwarder:
                                 )
                     continue
 
-                if resp.status_code >= 500:
+                if outcome == "upstream_5xx":
                     self._record_failure(db, key, reason="upstream_5xx", status_code=resp.status_code)
                     last_error_response = resp
                     retry_count += 1
@@ -830,12 +917,6 @@ class Forwarder:
                                     selection_score=selection_score,
                                 )
                     continue
-
-                # Other 4xx (e.g. 400/404/422): score penalty + immediate credit refresh
-                if 400 <= resp.status_code < 500:
-                    self._refresh_credits_on_4xx(
-                        db, key, status_code=int(resp.status_code), request_id=request_id
-                    )
 
                 credit_changed = False
                 if 200 <= resp.status_code < 300:
@@ -1082,7 +1163,7 @@ class Forwarder:
                 observed_cooldown_until=key.cooldown_until,
             )
 
-        if resp.status_code in {401, 403}:
+        if classify_upstream_outcome(resp) == "invalid_key":
             self._disable_key(db, key, resp.status_code)
             logger.info(
                 "upstream.key_test_unauthorized",
@@ -1207,7 +1288,7 @@ class Forwarder:
             cooldown = _parse_retry_after(resp.headers) or self._config.rate_limit.cooldown_seconds
             self._mark_cooling(db, key, cooldown)
 
-        if resp.status_code in {401, 403}:
+        if classify_upstream_outcome(resp) == "invalid_key":
             self._disable_key(db, key, resp.status_code)
 
         if resp.status_code >= 500:

@@ -24,63 +24,51 @@ DISABLED_STATUSES = frozenset({"disabled", "decrypt_failed", "invalid"})
 # Soft-unavailable: may recover after cooldown ("failed" is used by transient failure threshold).
 COOLING_STATUSES = frozenset({"cooling", "failed"})
 
-# Reasons / tokens that count as 4xx for selection-score penalty (only 4xx reduce score).
+# Reasons / tokens that count as key-attributable 4xx for selection-score penalty.
+# Only 401 (bad key), 402 (credits), 429 (this key's rate/concurrency).
+# Target-site 403/400/404/422 and 5xx must not reduce score.
 _SCORE_4XX_REASON_TOKENS = frozenset(
     {
-        "upstream_4xx",
-        "http_4xx",
-        "client_error",
-        "4xx",
-        "400",
         "401",
         "402",
-        "403",
-        "404",
-        "405",
-        "408",
-        "409",
-        "410",
-        "413",
-        "414",
-        "415",
-        "422",
-        "425",
         "429",
-        "451",
+        "key_4xx_401",
+        "key_4xx_402",
+        "key_4xx_429",
+        "invalid_key",
+        "credit",
+        "rate_limit",
     }
 )
 
+_KEY_ATTRIBUTABLE_STATUSES = frozenset({401, 402, 429})
+
 
 def is_4xx_score_failure(*, reason: str = "", status_code: int | None = None) -> bool:
-    """True when this failure should reduce selection score (4xx only)."""
+    """True when this failure should reduce selection score (key-attributable 4xx only)."""
     if status_code is not None:
         try:
             code = int(status_code)
         except (TypeError, ValueError):
             code = None
         else:
-            if 400 <= code < 500:
+            if code in _KEY_ATTRIBUTABLE_STATUSES:
                 return True
-            if code >= 500 or code < 400:
-                # explicit non-4xx status wins over ambiguous reason strings
-                if code != 0:
-                    return False
+            if code != 0:
+                # explicit non-key status wins over ambiguous reason strings
+                return False
     r = (reason or "").strip().lower()
     if not r:
         return False
     if r in _SCORE_4XX_REASON_TOKENS:
         return True
-    # e.g. "upstream_4xx_422", "http_4xx"
-    if "4xx" in r or "upstream_4" in r:
-        return True
-    # bare status embedded in reason
     for tok in r.replace("-", "_").split("_"):
         if tok.isdigit():
             try:
                 c = int(tok)
             except ValueError:
                 continue
-            if 400 <= c < 500:
+            if c in _KEY_ATTRIBUTABLE_STATUSES:
                 return True
     return False
 
@@ -234,9 +222,10 @@ class KeyPool:
         """
         Record a failure for scoring.
 
-        Only **HTTP 4xx** (client errors) reduce selection score.
-        5xx, timeouts, and other network/transport failures are ignored here
-        (they may still feed separate cooldown / failed-threshold logic in the forwarder).
+        Only **key-attributable HTTP 4xx** (401 / 402 / 429) reduce selection score.
+        Target-site 403/400/404/422, 5xx, timeouts, and other network/transport
+        failures are ignored here (they may still feed separate cooldown /
+        failed-threshold logic in the forwarder).
         """
         if not is_4xx_score_failure(reason=reason, status_code=status_code):
             return

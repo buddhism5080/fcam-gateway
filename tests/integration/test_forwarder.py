@@ -366,3 +366,84 @@ def test_forwarder_credit_error_switches_key(tmp_path):
     assert result.api_key_id == k2.id
     db.refresh(k1)
     assert k1.cached_remaining_credits == 0
+
+
+def test_forwarder_site_unsupported_403_does_not_disable_or_switch(tmp_path):
+    config, db = _setup_db(tmp_path)
+    secrets = Secrets(admin_token="admin", master_key="master")
+    client, _ = _add_client(db, secrets.master_key, max_retries=3)
+    k1 = _add_key(db, secrets.master_key, "fc-key-1", "h1", "0001", remaining=50_000)
+    _add_key(db, secrets.master_key, "fc-key-2", "h2", "0002", remaining=100)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={
+                "success": False,
+                "error": "We apologize for the inconvenience but we do not support this site.",
+            },
+        )
+
+    fwd = Forwarder(
+        config=config,
+        secrets=secrets,
+        key_pool=KeyPool(),
+        key_concurrency=ConcurrencyManager(),
+        transport=httpx.MockTransport(handler),
+    )
+    result = fwd.forward(
+        db=db,
+        request_id="req_site_403",
+        client=client,
+        method="POST",
+        upstream_path="/scrape",
+        json_body={"url": "https://blocked.example"},
+        inbound_headers={"content-type": "application/json"},
+    )
+    assert result.upstream_status_code == 403
+    assert result.api_key_id == k1.id
+    db.refresh(k1)
+    assert k1.status == "active"
+    assert k1.is_active is True
+    assert k1.cached_remaining_credits == 50_000
+
+
+def test_forwarder_scrape_engines_failed_500_does_not_switch_key(tmp_path):
+    config, db = _setup_db(tmp_path)
+    secrets = Secrets(admin_token="admin", master_key="master")
+    client, _ = _add_client(db, secrets.master_key, max_retries=3)
+    k1 = _add_key(db, secrets.master_key, "fc-key-1", "h1", "0001", remaining=50_000)
+    _add_key(db, secrets.master_key, "fc-key-2", "h2", "0002", remaining=100)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={
+                "success": False,
+                "code": "SCRAPE_ALL_ENGINES_FAILED",
+                "error": "All scraping engines failed to retrieve content from this URL.",
+            },
+        )
+
+    fwd = Forwarder(
+        config=config,
+        secrets=secrets,
+        key_pool=KeyPool(),
+        key_concurrency=ConcurrencyManager(),
+        transport=httpx.MockTransport(handler),
+    )
+    result = fwd.forward(
+        db=db,
+        request_id="req_site_500",
+        client=client,
+        method="POST",
+        upstream_path="/scrape",
+        json_body={"url": "https://blocked.example"},
+        inbound_headers={"content-type": "application/json"},
+    )
+    # 5xx still retries same-class failures, but must not disable / credit-zero the key.
+    assert result.upstream_status_code == 500
+    db.refresh(k1)
+    assert k1.status == "active"
+    assert k1.is_active is True
+    assert k1.cached_remaining_credits == 50_000
