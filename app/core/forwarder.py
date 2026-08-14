@@ -545,55 +545,51 @@ class Forwarder:
 
                         except httpx.TimeoutException as exc:
                             self._record_failure(db, pinned_key, reason="timeout")
-                            if attempt >= total_attempts - 1:
-                                logger.info(
-                                    "upstream.timeout",
-                                    extra={
-                                        "fields": {
-                                            "request_id": request_id,
-                                            "api_key_id": pinned_key.id,
-                                        }
-                                    },
-                                )
-                                raise FcamError(
-                                    status_code=504,
-                                    code="UPSTREAM_TIMEOUT",
-                                    message="Upstream timeout",
-                                    details={
-                                        "base_url": self._config.firecrawl.base_url,
-                                        "timeout_s": self._config.firecrawl.timeout,
-                                        "attempts": total_attempts,
-                                        "method": method,
-                                        "upstream_path": upstream_path,
-                                    },
-                                ) from exc
-                            continue
+                            logger.info(
+                                "upstream.timeout",
+                                extra={
+                                    "fields": {
+                                        "request_id": request_id,
+                                        "api_key_id": pinned_key.id,
+                                    }
+                                },
+                            )
+                            raise FcamError(
+                                status_code=504,
+                                code="UPSTREAM_TIMEOUT",
+                                message="Upstream timeout",
+                                details={
+                                    "base_url": self._config.firecrawl.base_url,
+                                    "timeout_s": self._config.firecrawl.timeout,
+                                    "attempts": 1,
+                                    "method": method,
+                                    "upstream_path": upstream_path,
+                                },
+                            ) from exc
 
                         except httpx.HTTPError as exc:
                             self._record_failure(db, pinned_key, reason="http_error")
-                            if attempt >= total_attempts - 1:
-                                logger.info(
-                                    "upstream.unavailable",
-                                    extra={
-                                        "fields": {
-                                            "request_id": request_id,
-                                            "api_key_id": pinned_key.id,
-                                        }
-                                    },
-                                )
-                                raise FcamError(
-                                    status_code=503,
-                                    code="UPSTREAM_UNAVAILABLE",
-                                    message="Upstream unavailable",
-                                    details={
-                                        "base_url": self._config.firecrawl.base_url,
-                                        "attempts": total_attempts,
-                                        "method": method,
-                                        "upstream_path": upstream_path,
-                                        "error": str(exc),
-                                    },
-                                ) from exc
-                            continue
+                            logger.info(
+                                "upstream.unavailable",
+                                extra={
+                                    "fields": {
+                                        "request_id": request_id,
+                                        "api_key_id": pinned_key.id,
+                                    }
+                                },
+                            )
+                            raise FcamError(
+                                status_code=503,
+                                code="UPSTREAM_UNAVAILABLE",
+                                message="Upstream unavailable",
+                                details={
+                                    "base_url": self._config.firecrawl.base_url,
+                                    "attempts": 1,
+                                    "method": method,
+                                    "upstream_path": upstream_path,
+                                    "error": str(exc),
+                                },
+                            ) from exc
                         finally:
                             lease.release()
 
@@ -640,16 +636,14 @@ class Forwarder:
 
                         if outcome == "upstream_5xx":
                             self._record_failure(db, pinned_key, reason="upstream_5xx", status_code=resp.status_code)
-                            if attempt >= total_attempts - 1:
-                                return ForwardResult(
-                                    response=_to_fastapi_response(resp),
-                                    upstream_status_code=last_upstream_status,
-                                    api_key_id=last_api_key_id,
-                                    retry_count=retry_count,
+                            return ForwardResult(
+                                response=_to_fastapi_response(resp),
+                                upstream_status_code=last_upstream_status,
+                                api_key_id=last_api_key_id,
+                                retry_count=retry_count,
                                     switch_reasons=switch_reasons,
                                     selection_score=selection_score,
                                 )
-                            continue
 
                         credit_changed = False
                         if 200 <= resp.status_code < 300:
@@ -809,49 +803,41 @@ class Forwarder:
 
                 except httpx.TimeoutException as exc:
                     self._record_failure(db, key, reason="timeout")
-                    retry_count += 1
-                    upstream_attempts += 1
-                    if upstream_attempts >= total_attempts:
-                        logger.info(
-                            "upstream.timeout",
-                            extra={"fields": {"request_id": request_id, "api_key_id": key.id}},
-                        )
-                        raise FcamError(
-                            status_code=504,
-                            code="UPSTREAM_TIMEOUT",
-                            message="Upstream timeout",
-                            details={
-                                "base_url": self._config.firecrawl.base_url,
-                                "timeout_s": self._config.firecrawl.timeout,
-                                "attempts": total_attempts,
-                                "method": method,
-                                "upstream_path": upstream_path,
-                            },
-                        ) from exc
-                    continue
+                    logger.info(
+                        "upstream.timeout",
+                        extra={"fields": {"request_id": request_id, "api_key_id": key.id}},
+                    )
+                    raise FcamError(
+                        status_code=504,
+                        code="UPSTREAM_TIMEOUT",
+                        message="Upstream timeout",
+                        details={
+                            "base_url": self._config.firecrawl.base_url,
+                            "timeout_s": self._config.firecrawl.timeout,
+                            "attempts": 1,
+                            "method": method,
+                            "upstream_path": upstream_path,
+                        },
+                    ) from exc
 
                 except httpx.HTTPError as exc:
                     self._record_failure(db, key, reason="http_error")
-                    retry_count += 1
-                    upstream_attempts += 1
-                    if upstream_attempts >= total_attempts:
-                        logger.info(
-                            "upstream.unavailable",
-                            extra={"fields": {"request_id": request_id, "api_key_id": key.id}},
-                        )
-                        raise FcamError(
-                            status_code=503,
-                            code="UPSTREAM_UNAVAILABLE",
-                            message="Upstream unavailable",
-                            details={
-                                "base_url": self._config.firecrawl.base_url,
-                                "attempts": total_attempts,
-                                "method": method,
-                                "upstream_path": upstream_path,
-                                "error": str(exc),
-                            },
-                        ) from exc
-                    continue
+                    logger.info(
+                        "upstream.unavailable",
+                        extra={"fields": {"request_id": request_id, "api_key_id": key.id}},
+                    )
+                    raise FcamError(
+                        status_code=503,
+                        code="UPSTREAM_UNAVAILABLE",
+                        message="Upstream unavailable",
+                        details={
+                            "base_url": self._config.firecrawl.base_url,
+                            "attempts": 1,
+                            "method": method,
+                            "upstream_path": upstream_path,
+                            "error": str(exc),
+                        },
+                    ) from exc
 
                 finally:
                     lease.release()
@@ -905,18 +891,14 @@ class Forwarder:
 
                 if outcome == "upstream_5xx":
                     self._record_failure(db, key, reason="upstream_5xx", status_code=resp.status_code)
-                    last_error_response = resp
-                    retry_count += 1
-                    if upstream_attempts >= total_attempts:
-                        return ForwardResult(
-                            response=_to_fastapi_response(resp),
-                            upstream_status_code=last_upstream_status,
-                            api_key_id=last_api_key_id,
-                            retry_count=retry_count - 1,
+                    return ForwardResult(
+                        response=_to_fastapi_response(resp),
+                        upstream_status_code=last_upstream_status,
+                        api_key_id=last_api_key_id,
+                        retry_count=retry_count,
                                     switch_reasons=switch_reasons,
                                     selection_score=selection_score,
                                 )
-                    continue
 
                 credit_changed = False
                 if 200 <= resp.status_code < 300:

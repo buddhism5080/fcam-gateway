@@ -168,11 +168,13 @@ def test_forwarder_disables_key_on_401_then_uses_next(tmp_path):
 def test_forwarder_timeout_raises_gateway_error(tmp_path):
     config, db = _setup_db(tmp_path)
     secrets = Secrets(admin_token="admin", master_key="master")
-    # Per-client retry budget of 0 → single attempt
-    client, _ = _add_client(db, secrets.master_key, max_retries=0)
+    # Non-key transport errors must not consume the retry budget.
+    client, _ = _add_client(db, secrets.master_key, max_retries=3)
     _add_key(db, secrets.master_key, "fc-key-1", "h1", "0001")
+    hits = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
         raise httpx.ReadTimeout("timeout", request=request)
 
     fwd = Forwarder(
@@ -195,6 +197,7 @@ def test_forwarder_timeout_raises_gateway_error(tmp_path):
         )
     assert e.value.code == "UPSTREAM_TIMEOUT"
     assert e.value.status_code == 504
+    assert hits["n"] == 1
 
 
 def test_forwarder_marks_failed_after_threshold(tmp_path):
@@ -374,8 +377,10 @@ def test_forwarder_site_unsupported_403_does_not_disable_or_switch(tmp_path):
     client, _ = _add_client(db, secrets.master_key, max_retries=3)
     k1 = _add_key(db, secrets.master_key, "fc-key-1", "h1", "0001", remaining=50_000)
     _add_key(db, secrets.master_key, "fc-key-2", "h2", "0002", remaining=100)
+    hits = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
         return httpx.Response(
             403,
             json={
@@ -402,6 +407,8 @@ def test_forwarder_site_unsupported_403_does_not_disable_or_switch(tmp_path):
     )
     assert result.upstream_status_code == 403
     assert result.api_key_id == k1.id
+    assert result.retry_count == 0
+    assert hits["n"] == 1
     db.refresh(k1)
     assert k1.status == "active"
     assert k1.is_active is True
@@ -414,8 +421,10 @@ def test_forwarder_scrape_engines_failed_500_does_not_switch_key(tmp_path):
     client, _ = _add_client(db, secrets.master_key, max_retries=3)
     k1 = _add_key(db, secrets.master_key, "fc-key-1", "h1", "0001", remaining=50_000)
     _add_key(db, secrets.master_key, "fc-key-2", "h2", "0002", remaining=100)
+    hits = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
         return httpx.Response(
             500,
             json={
@@ -441,9 +450,48 @@ def test_forwarder_scrape_engines_failed_500_does_not_switch_key(tmp_path):
         json_body={"url": "https://blocked.example"},
         inbound_headers={"content-type": "application/json"},
     )
-    # 5xx still retries same-class failures, but must not disable / credit-zero the key.
+    # Site/request 5xx must not retry or switch keys.
     assert result.upstream_status_code == 500
+    assert result.retry_count == 0
+    assert hits["n"] == 1
     db.refresh(k1)
     assert k1.status == "active"
+    assert k1.is_active is True
+    assert k1.cached_remaining_credits == 50_000
+
+
+def test_forwarder_generic_500_does_not_retry(tmp_path):
+    config, db = _setup_db(tmp_path)
+    secrets = Secrets(admin_token="admin", master_key="master")
+    client, _ = _add_client(db, secrets.master_key, max_retries=3)
+    k1 = _add_key(db, secrets.master_key, "fc-key-1", "h1", "0001", remaining=50_000)
+    _add_key(db, secrets.master_key, "fc-key-2", "h2", "0002", remaining=100)
+    hits = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        return httpx.Response(500, json={"error": "Internal Server Error"})
+
+    fwd = Forwarder(
+        config=config,
+        secrets=secrets,
+        key_pool=KeyPool(),
+        key_concurrency=ConcurrencyManager(),
+        transport=httpx.MockTransport(handler),
+    )
+    result = fwd.forward(
+        db=db,
+        request_id="req_generic_500",
+        client=client,
+        method="POST",
+        upstream_path="/scrape",
+        json_body={"url": "https://example.com"},
+        inbound_headers={"content-type": "application/json"},
+    )
+    assert result.upstream_status_code == 500
+    assert result.retry_count == 0
+    assert hits["n"] == 1
+    db.refresh(k1)
+    assert k1.status != "invalid"
     assert k1.is_active is True
     assert k1.cached_remaining_credits == 50_000
